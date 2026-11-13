@@ -46,4 +46,6 @@ Smoke en marcha (Ctrl-C para detener).
   Logs:              $T/{bot,gateway}.log   Auditoría: $T/bot-data/audit.jsonl
 En Telegram, abre el bot y prueba /start, /servers y /dump.
 MSG
-sleep infinity & wait $!
+sleep infinity &
+PIDS+=($!)
+wait $!

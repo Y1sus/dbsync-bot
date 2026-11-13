@@ -1,0 +1,92 @@
+<!--
+  deploy/README.md — Runbook de despliegue de dbsync-bot con docker compose
+  Autor: Jesús Montalvo <jmontalvo_m@outlook.com>
+-->
+# Despliegue
+
+Los comandos marcados **(sudo)** los corre una persona con sudo; el usuario `yisus` del VPS no lo tiene sin contraseña.
+
+## 0. Probar antes en este equipo (sin VPS)
+
+```bash
+scripts/init_deploy.sh        # carpetas, secrets/gateway_token, .env
+docker compose up -d --build  # bot + gateway locales; el gateway en 127.0.0.1:18090
+docker compose logs -f bot
+docker compose down
+```
+
+Para probar con un servidor de dev real usa una carpeta que solo lo contenga:
+
+```bash
+mkdir -p /tmp/servers-dev && install -m 600 servers/devlion.env /tmp/servers-dev/
+DBSYNC_SERVERS_DIR=/tmp/servers-dev docker compose up -d
+```
+
+La llave dedicada es `secrets/ssh/dbsync_bot_ed25519`. Su pública se agrega al
+`authorized_keys` del servidor de dev. Luego se fijan sus llaves de host:
+
+```bash
+scripts/pin_known_hosts.sh devlion            # muestra huellas; compáralas con la consola del proveedor
+scripts/pin_known_hosts.sh --write devlion    # las agrega a secrets/known_hosts
+```
+
+## 1. Variables
+
+`.env` (copia de `.env.example`): `DBSYNC_UID`/`DBSYNC_GID` deben ser los del dueño de `data/` y
+`secrets/` (en el VPS, `id -u` y `id -g` de `yisus`, ambos 1000), `GATEWAY_PUBLIC_BASE_URL`,
+`BOT_ALLOWED_USER_IDS` y `GATEWAY_HOST_PORT` (18090: el 18080 ya lo usa engram).
+
+## 2. VPS
+
+```bash
+ssh -A yisus@147.182.254.199
+git clone git@github.com:Y1sus/dbsync-bot.git ~/dbsync-bot && cd ~/dbsync-bot
+```
+
+Desde tu equipo, copia los secretos (nunca por git) y solo los servidores que quieras exponer:
+
+```bash
+scp secrets/telegram_token yisus@147.182.254.199:~/dbsync-bot/secrets/
+scp secrets/ssh/dbsync_bot_ed25519 yisus@147.182.254.199:~/dbsync-bot/secrets/ssh/
+```
+
+En el VPS:
+
+```bash
+scripts/init_deploy.sh                      # crea data/, gateway_token y .env; revisa .env
+mkdir -p servers-prod && chmod 700 servers-prod     # y copia ahí los .env elegidos (chmod 600)
+echo "DBSYNC_SERVERS_DIR=./servers-prod" >> .env
+scripts/pin_known_hosts.sh --write <servidor>   # tras verificar las huellas
+docker compose up -d --build
+docker compose ps && docker compose logs --tail 20 bot
+```
+
+## 3. nginx y TLS **(sudo)**
+
+DNS: registro A de `dumps.synkra.app` hacia `147.182.254.199` antes de certbot.
+
+```bash
+sudo cp deploy/nginx/dumps.synkra.app /etc/nginx/sites-available/dumps.synkra.app
+sudo ln -s /etc/nginx/sites-available/dumps.synkra.app /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+sudo certbot --nginx -d dumps.synkra.app
+```
+
+Verificación: `curl -sI https://dumps.synkra.app/d/x` responde `404`, y `curl -sI https://dumps.synkra.app/v1/health` también (la API interna no se publica).
+
+## 4. Después del despliegue
+
+- Revoca el token en @BotFather (`/revoke`), guarda el nuevo en `secrets/telegram_token` (600) y `docker compose restart bot`.
+- `/setjoingroups` → Disable en @BotFather.
+- En los servidores de producción, usuario de BD de solo lectura en su `.env` (hoy todos usan `root`).
+
+## 5. Operación
+
+| Qué | Comando |
+|---|---|
+| Estado y logs | `docker compose ps`, `docker compose logs -f bot gateway` |
+| Auditoría | `data/bot/audit.jsonl`, `data/gateway/audit.jsonl` |
+| Actualizar | `git pull && docker compose up -d --build` |
+| Detener | `docker compose down` (los dumps de `data/dumps` se conservan hasta que la limpieza los borre) |
+
+El bot hace polling con el token: **dos instancias con el mismo token chocan** (409). Detén el smoke local antes de levantar el compose.

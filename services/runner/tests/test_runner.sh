@@ -142,6 +142,17 @@ assert_eq "ssh falla: E_SSH" E_SSH "$(jqv .error.code)"
 assert_not_contains "el password se redacta del stderr devuelto" "SuperSecreto123" "$OUT"
 rm -f "$T/servers/leak.env"
 
+# --- llave dedicada por entorno ----------------------------------------------
+printf 'SERVER_HOST=127.0.0.1\nSERVER_USER=u\nSERVER_KEY=/no/existe\nDB_PASSWORD=pw\n' > "$T/servers/keyenv.env"
+chmod 600 "$T/servers/keyenv.env"
+run_runner containers --server keyenv
+assert_eq "SERVER_KEY inexistente sin override: E_CONFIG" E_CONFIG "$(jqv .error.code)"
+: > "$T/ssh.log"
+DBSYNC_SSH_KEY="$T/key" run_runner containers --server keyenv
+assert_eq "DBSYNC_SSH_KEY reemplaza SERVER_KEY del .env" true "$(jqv .ok)"
+assert_contains "ssh usa la llave dedicada" "[-i] [$T/key]" "$(grep '^ARGV' "$T/ssh.log" | head -1)"
+rm -f "$T/servers/keyenv.env"
+
 # --- configuración inválida --------------------------------------------------
 printf 'SERVER_HOST=x\nSERVER_USER=u\nSERVER_KEY=%s\nDB_PASSWORD=a\nDB_USER="ro;ot"\n' "$T/key" > "$T/servers/bad.env"
 run_runner containers --server bad

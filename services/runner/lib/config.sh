@@ -27,6 +27,8 @@ load_server() {
     source "$file"
 
     SERVER_ID="$name"
+    # Una llave dedicada del entorno tiene prioridad sobre la del .env (despliegue en contenedor)
+    [[ -z "${DBSYNC_SSH_KEY:-}" ]] || SERVER_KEY="$DBSYNC_SSH_KEY"
     SERVER_PORT="${SERVER_PORT:-22}"
     DB_ACCESS_MODE="${DB_ACCESS_MODE:-docker}"
     DB_USER="${DB_USER:-root}"

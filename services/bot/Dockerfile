@@ -5,6 +5,10 @@
 # =============================================================================
 FROM python:3.14-slim
 
+# ssh exige que el UID exista en /etc/passwd: se construye con el UID del dueño de los volúmenes
+ARG APP_UID=10001
+ARG APP_GID=10001
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     BOT_RUNNER_PATH=/app/runner/runner.sh \
@@ -14,10 +18,10 @@ ENV PYTHONUNBUFFERED=1 \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends openssh-client jq bash tini \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid 10001 bot \
-    && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin bot \
+    && groupadd --gid ${APP_GID} bot \
+    && useradd --uid ${APP_UID} --gid ${APP_GID} --no-create-home --shell /usr/sbin/nologin bot \
     && mkdir -p /app /data \
-    && chown 10001:10001 /data
+    && chown ${APP_UID}:${APP_GID} /data
 
 WORKDIR /app
 
@@ -30,5 +34,5 @@ RUN chmod 0755 /app/runner/runner.sh
 
 # tini cosecha los ssh huérfanos que deja el matado del grupo de procesos
 ENTRYPOINT ["/usr/bin/tini", "--"]
-USER 10001:10001
+USER ${APP_UID}:${APP_GID}
 CMD ["python", "-m", "bot"]

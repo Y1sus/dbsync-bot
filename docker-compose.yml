@@ -1,0 +1,83 @@
+# =============================================================================
+# docker-compose.yml — Despliegue de dbsync-bot (gateway + bot) en un solo host
+# El gateway publica solo el puerto público en 127.0.0.1 (nginx es su único cliente);
+# la API interna (8081) nunca se publica. Variables en .env (ver .env.example).
+# Autor: Jesús Montalvo <jmontalvo_m@outlook.com>
+# =============================================================================
+name: dbsync-bot
+
+x-base: &base
+  restart: unless-stopped
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  # UID del dueño de ./data y ./secrets: así no hace falta chown ni root
+  user: "${DBSYNC_UID:-1000}:${DBSYNC_GID:-1000}"
+  tmpfs: ["/tmp:size=16m,mode=1777"]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  gateway:
+    <<: *base
+    build:
+      context: services/gateway
+      args: { APP_UID: "${DBSYNC_UID:-1000}", APP_GID: "${DBSYNC_GID:-1000}" }
+    image: dbsync-bot-gateway:local
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 100
+    environment:
+      GATEWAY_PUBLIC_BASE_URL: "${GATEWAY_PUBLIC_BASE_URL:?Define GATEWAY_PUBLIC_BASE_URL en .env}"
+      GATEWAY_DUMPS_ROOT: /dumps
+      GATEWAY_DATA_DIR: /data
+      GATEWAY_API_TOKEN_FILE: /run/secrets/gateway_token
+      GATEWAY_RETENTION_HOURS: "${GATEWAY_RETENTION_HOURS:-24}"
+      GATEWAY_MAX_DUMPS_GB: "${GATEWAY_MAX_DUMPS_GB:-8}"
+    volumes:
+      - ./data/dumps:/dumps
+      - ./data/gateway:/data
+    secrets: [gateway_token]
+    ports:
+      - "127.0.0.1:${GATEWAY_HOST_PORT:-18090}:8080"
+
+  bot:
+    <<: *base
+    build:
+      context: .
+      dockerfile: services/bot/Dockerfile
+      args: { APP_UID: "${DBSYNC_UID:-1000}", APP_GID: "${DBSYNC_GID:-1000}" }
+    image: dbsync-bot-bot:local
+    depends_on:
+      gateway: { condition: service_healthy }
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 200
+    environment:
+      BOT_TOKEN_FILE: /run/secrets/telegram_token
+      BOT_ALLOWED_USER_IDS: "${BOT_ALLOWED_USER_IDS:?Define BOT_ALLOWED_USER_IDS en .env}"
+      BOT_GATEWAY_URL: http://gateway:8081
+      BOT_GATEWAY_TOKEN_FILE: /run/secrets/gateway_token
+      BOT_DEFAULT_TTL_SECONDS: "${BOT_DEFAULT_TTL_SECONDS:-3600}"
+      BOT_DEFAULT_MAX_DOWNLOADS: "${BOT_DEFAULT_MAX_DOWNLOADS:-1}"
+      DBSYNC_SERVERS_DIR: /run/servers
+      DBSYNC_DUMPS_DIR: /dumps
+      DBSYNC_KNOWN_HOSTS: /run/secrets/known_hosts
+      DBSYNC_SSH_KEY: /run/secrets/dbsync_ssh_key
+      DBSYNC_MIN_FREE_MB: "${DBSYNC_MIN_FREE_MB:-1024}"
+    volumes:
+      - ./data/dumps:/dumps
+      - ./data/bot:/data
+      - ${DBSYNC_SERVERS_DIR:-./servers}:/run/servers:ro
+    secrets: [telegram_token, gateway_token, dbsync_ssh_key, known_hosts]
+
+secrets:
+  telegram_token:
+    file: ./secrets/telegram_token
+  gateway_token:
+    file: ./secrets/gateway_token
+  dbsync_ssh_key:
+    file: ./secrets/ssh/dbsync_bot_ed25519
+  known_hosts:
+    file: ./secrets/known_hosts

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# =============================================================================
+# tests/shims/ssh — Shim de ssh: registra argv y stdin y ejecuta el comando
+# remoto en local (el último argumento), con el docker falso en el PATH.
+# Autor: Jesús Montalvo <jmontalvo_m@outlook.com>
+# =============================================================================
+log="${SHIM_LOG:?SHIM_LOG requerido}"
+cmd="${!#}"
+{ printf 'ARGV:'; printf ' [%s]' "$@"; printf '\n'; } >> "$log"
+stdin_data="$(cat)"
+printf 'STDIN: %s\n' "$stdin_data" >> "$log"
+export PATH="${SHIM_PATH_PREFIX:+$SHIM_PATH_PREFIX:}$PATH"
+printf '%s\n' "$stdin_data" | bash -c "$cmd"

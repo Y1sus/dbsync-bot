@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# =============================================================================
+# .githooks/pre-commit — Corre las pruebas de puerta antes de cada commit
+# Activar con: git config core.hooksPath .githooks
+# Autor: Jesús Montalvo <jmontalvo_m@outlook.com>
+# =============================================================================
+exec "$(git rev-parse --show-toplevel)/scripts/test.sh"

@@ -1,0 +1,20 @@
+# =============================================================================
+# .gitignore — Excluye credenciales, llaves y dumps
+# Autor: Jesús Montalvo <jmontalvo_m@outlook.com>
+# =============================================================================
+
+# Credenciales y llaves: NUNCA commitear
+servers/*.env
+!servers/example.env
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+known_hosts*
+.env
+
+# Dumps y estado en runtime
+dumps/
+data/
+*.part
+*.lock

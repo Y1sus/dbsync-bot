@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# =============================================================================
+# tests/shims/docker — Docker falso controlado por FAKE_MODE (ok|truncated|fail)
+# Registra el valor de cada variable pasada con `-e VAR` en FAKE_ENVLOG.
+# Autor: Jesús Montalvo <jmontalvo_m@outlook.com>
+# =============================================================================
+mode="${FAKE_MODE:-ok}"
+case "${1:-}" in
+    ps)
+        printf 'fakemysql|mysql:8.0\nfakepg|postgres:16-alpine\nredis1|redis:7\n'
+        exit 0 ;;
+    exec)
+        shift
+        while [[ "${1:-}" == "-e" ]]; do
+            var="$2"
+            printf '%s=%s\n' "$var" "${!var-<unset>}" >> "${FAKE_ENVLOG:-/dev/null}"
+            shift 2
+        done
+        container="$1"; shift
+        tool="$1"; shift
+        if [[ "$container" == "${FAKE_FAIL_CONTAINER:-}" && "$tool" =~ ^(mysql|psql)$ ]]; then
+            echo "ERROR 1045 (28000): Access denied for user" >&2; exit 1
+        fi
+        case "$tool" in
+            mysql) printf 'information_schema\nmysql\nsys\nappdb\nother_db\n' ;;
+            psql)  printf 'postgres\npgapp\n' ;;
+            mysqldump|pg_dump)
+                printf -- '-- cabecera\nCREATE TABLE t (id int);\nINSERT INTO t VALUES (1);\n'
+                case "$mode" in
+                    fail) echo "mysqldump: Got error: 1045: Access denied" >&2; exit 2 ;;
+                    truncated) exit 0 ;;
+                esac
+                if [[ "$tool" == "mysqldump" ]]; then
+                    printf -- '-- Dump completed on 2026-01-01 00:00:00\n'
+                else
+                    printf -- '--\n-- PostgreSQL database dump complete\n--\n'
+                fi ;;
+        esac
+        exit 0 ;;
+esac
+exit 0

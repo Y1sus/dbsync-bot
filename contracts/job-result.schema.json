@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dbsync-bot/contracts/job-result.schema.json",
+  "$comment": "Contrato del runner. Autor: Jesús Montalvo <jmontalvo_m@outlook.com>. Versión 1.0.0. Todo cambio incompatible incrementa schema_version y se actualizan runner y consumidores a la vez.",
+  "title": "RunnerResult",
+  "description": "Salida JSON (una línea) de services/runner/runner.sh por stdout. Los logs van a stderr.",
+  "type": "object",
+  "required": ["schema_version", "ok", "command"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "ok": { "type": "boolean" },
+    "command": { "enum": ["servers", "containers", "dbs", "dump"] }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/error" },
+    { "$ref": "#/$defs/servers" },
+    { "$ref": "#/$defs/containers" },
+    { "$ref": "#/$defs/dbs" },
+    { "$ref": "#/$defs/dump" }
+  ],
+  "$defs": {
+    "error": {
+      "properties": {
+        "ok": { "const": false },
+        "error": {
+          "type": "object",
+          "required": ["code", "message", "stderr"],
+          "properties": {
+            "code": {
+              "enum": [
+                "E_USAGE", "E_CONFIG", "E_INVALID_NAME", "E_SERVER_NOT_FOUND",
+                "E_NOT_DISCOVERED", "E_LOCKED", "E_SSH", "E_DUMP_FAILED",
+                "E_TRUNCATED", "E_DISK", "E_INTERNAL"
+              ]
+            },
+            "message": { "type": "string" },
+            "stderr": { "type": "string", "description": "Últimas líneas del stderr remoto, sin el password." }
+          }
+        }
+      },
+      "required": ["ok", "error"]
+    },
+    "servers": {
+      "properties": {
+        "ok": { "const": true },
+        "command": { "const": "servers" },
+        "servers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "host", "access_mode"],
+            "properties": {
+              "name": { "type": "string" },
+              "host": { "type": "string" },
+              "access_mode": { "enum": ["docker", "native", "native+sudo"] }
+            }
+          }
+        }
+      },
+      "required": ["ok", "servers"]
+    },
+    "containers": {
+      "properties": {
+        "ok": { "const": true },
+        "command": { "const": "containers" },
+        "server": { "type": "string" },
+        "containers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "engine", "image", "db_count"],
+            "properties": {
+              "name": { "type": "string" },
+              "engine": { "enum": ["mysql", "postgresql"] },
+              "image": { "type": "string" },
+              "db_count": { "type": ["integer", "null"], "minimum": 0, "description": "null si las credenciales del servidor no abren ese contenedor; ver list_error." },
+              "list_error": { "type": "string" }
+            }
+          }
+        }
+      },
+      "required": ["ok", "server", "containers"]
+    },
+    "dbs": {
+      "properties": {
+        "ok": { "const": true },
+        "command": { "const": "dbs" },
+        "server": { "type": "string" },
+        "container": { "type": "string" },
+        "engine": { "enum": ["mysql", "postgresql"] },
+        "databases": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["ok", "server", "container", "engine", "databases"]
+    },
+    "dump": {
+      "properties": {
+        "ok": { "const": true },
+        "command": { "const": "dump" },
+        "job_id": { "type": "string" },
+        "server": { "type": "string" },
+        "container": { "type": "string" },
+        "engine": { "enum": ["mysql", "postgresql"] },
+        "db": { "type": "string" },
+        "file": { "type": "string", "description": "Ruta absoluta en el sistema de archivos del runner. Otros servicios deben resolver relpath contra su propio montaje." },
+        "relpath": { "type": "string", "description": "<servidor>/<archivo>, relativo a la raíz de dumps." },
+        "filename": { "type": "string" },
+        "size_bytes": { "type": "integer", "minimum": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "duration_s": { "type": "integer", "minimum": 0 },
+        "verified": {
+          "type": "object",
+          "required": ["gzip", "trailer"],
+          "properties": {
+            "gzip": { "const": true },
+            "trailer": { "const": true, "description": "Marcador de fin de dump presente (dump completo)." }
+          }
+        }
+      },
+      "required": ["ok", "job_id", "server", "container", "engine", "db", "file", "relpath", "filename", "size_bytes", "sha256", "duration_s", "verified"]
+    }
+  }
+}

@@ -17,18 +17,22 @@ equipo y no se modifica desde aquí. Los arreglos de uno no se propagan al otro.
 | Fase | Servicio | Estado |
 |---|---|---|
 | 1 | `services/runner` | Hecha: runner no interactivo y endurecido |
-| 2 | `contracts/` | `job-result` listo; `LinkRecord` pendiente de la fase 3 |
-| 3 | `services/gateway` | Pendiente |
-| 4 | `services/bot` | Pendiente |
-| 5 | `docker-compose.yml` y despliegue | Pendiente |
+| 2 | `contracts/` | Hecha: `job-result`, `link` y `gateway-api` |
+| 3 | `services/gateway` | Hecha: enlaces, descargas con `Range`, limpieza |
+| 4 | `services/bot` | Hecha: bot de Telegram (aiogram) |
+| 5 | `docker-compose.yml` y despliegue | Pendiente (imágenes ya construyen) |
 
 ## Estructura
 
 ```
-contracts/                esquemas JSON que comparten los servicios
+contracts/                esquemas y contrato HTTP que comparten los servicios
 services/runner/          dump no interactivo (bash): runner.sh, lib/, tests/, evals/
+services/gateway/         enlaces temporales y descargas (Python + aiohttp)
+services/bot/             bot de Telegram (Python + aiogram), invoca el runner
+integration/              eval runner -> bot -> gateway real
 servers/example.env       plantilla de servidor (los .env reales no se commitean)
-scripts/test.sh           puerta: shellcheck + pruebas (<2 s); --eval agrega Docker real
+secrets/                  token del bot (ignorado por git, chmod 600)
+scripts/test.sh           puerta de todos los servicios en paralelo (~2 s); --eval agrega evals
 .githooks/pre-commit      corre scripts/test.sh antes de cada commit
 ```
 
@@ -36,8 +40,9 @@ scripts/test.sh           puerta: shellcheck + pruebas (<2 s); --eval agrega Doc
 
 ```bash
 git config core.hooksPath .githooks   # una vez por clon
-scripts/test.sh                       # puerta, sin red ni Docker
-scripts/test.sh --eval                # + evals con MySQL 8.0 y PostgreSQL 17/18 reales
+python3 -m venv .venv && .venv/bin/pip install -r services/gateway/requirements.txt -r services/bot/requirements.txt
+scripts/test.sh                       # puerta: runner, gateway, bot e integración, sin red ni Docker
+scripts/test.sh --eval                # + evals: MySQL 8.0 y PostgreSQL 17/18 reales, gateway y bot
 ```
 
 ## Qué cambió respecto a dbsync

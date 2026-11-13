@@ -1,0 +1,5 @@
+# =============================================================================
+# services/bot/requirements.txt — Dependencias del bot (única librería externa)
+# Autor: Jesús Montalvo <jmontalvo_m@outlook.com>
+# =============================================================================
+aiogram==3.31.0

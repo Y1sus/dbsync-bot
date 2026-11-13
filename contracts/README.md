@@ -10,17 +10,7 @@ Esquemas que ambos lados importan. Un cambio incompatible incrementa
 | Archivo | Productor | Consumidor | Versión |
 |---|---|---|---|
 | `job-result.schema.json` | `services/runner` | `services/bot` | 1 |
-
-## Pendiente: `LinkRecord` (fase 3)
-
-Con una sola descarga permitida, los previews de WhatsApp y Slack consumen el
-enlace antes de que alguien lo abra. El contrato debe cubrir:
-
-- `GET /d/<token>` muestra una página intermedia y no cuenta como descarga.
-- El archivo solo sale con un POST explícito; `HEAD` y bots de preview se ignoran.
-- La descarga cuenta al terminar, y `Range` reanuda dentro de la misma descarga.
-- Campos mínimos: `token_hash`, `file`, `expires_at`, `max_downloads` (default 1),
-  `downloads`, `created_by`, `job_id`.
+| `link.schema.json` + `gateway-api.md` | `services/gateway` | `services/bot` | v1 |
 
 ## Archivos de dump y permisos
 

@@ -12,6 +12,10 @@ id_rsa*
 id_ed25519*
 known_hosts*
 .env
+secrets/
+.venv/
+__pycache__/
+*.pyc
 
 # Dumps y estado en runtime
 dumps/

@@ -1,0 +1,5 @@
+# =============================================================================
+# services/gateway/requirements.txt — Dependencias fijadas del gateway
+# Autor: Jesús Montalvo <jmontalvo_m@outlook.com>
+# =============================================================================
+aiohttp==3.14.5

@@ -1,0 +1,20 @@
+# =============================================================================
+# .dockerignore — Excluye de la imagen del bot lo que no necesita ni debe llevar
+# Autor: Jesús Montalvo <jmontalvo_m@outlook.com>
+# =============================================================================
+.git
+.venv
+secrets
+servers
+dumps
+data
+integration
+scripts
+contracts
+services/gateway
+services/runner/tests
+services/runner/evals
+services/bot/tests
+services/bot/evals
+**/__pycache__
+**/*.pyc

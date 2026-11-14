@@ -25,7 +25,7 @@ server {
     location /d/ {
         limit_req zone=dumps_req burst=20 nodelay;
         limit_req_status 429;
-        limit_conn dumps_conn 4;
+        limit_conn dumps_conn 8;
         limit_conn_status 429;
 
         proxy_pass http://127.0.0.1:18090;

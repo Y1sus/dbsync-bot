@@ -1,5 +1,5 @@
 # =============================================================================
-# services/gateway/gateway/internal.py — API interna v1 (bearer) para el bot
+# services/gateway/gateway/internal.py — API interna v2 (bearer): enlaces de 1 a 4 archivos
 # Autor: Jesús Montalvo <jmontalvo_m@outlook.com>
 # =============================================================================
 
@@ -19,7 +19,9 @@ log = logging.getLogger("gateway.internal")
 CTX = web.AppKey("ctx", Context)
 
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
-ALLOWED_FIELDS = {"relpath", "sha256", "ttl_seconds", "max_downloads", "created_by", "job_id", "label"}
+ALLOWED_FIELDS = {"files", "ttl_seconds", "max_downloads", "created_by", "job_id", "label"}
+FILE_FIELDS = {"relpath", "sha256"}
+MAX_FILES = 4
 
 
 class ApiError(Exception):
@@ -56,18 +58,37 @@ def _integer(body, name, default, lo, hi):
     return value
 
 
+def _file_specs(raw):
+    if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_FILES:
+        raise ApiError(400, "invalid_request", f"files debe ser una lista de 1 a {MAX_FILES} elementos")
+    specs = []
+    for item in raw:
+        if not isinstance(item, dict) or set(item) - FILE_FIELDS:
+            raise ApiError(400, "invalid_request", "Cada archivo admite solo relpath y sha256")
+        relpath = _text(item, "relpath", 1024, required=True)
+        sha = item.get("sha256")
+        if sha is not None and (not isinstance(sha, str) or not SHA_RE.match(sha)):
+            raise ApiError(400, "invalid_request", "sha256 debe ser hexadecimal en minúsculas de 64 caracteres")
+        try:
+            paths.validate_relpath(relpath)
+        except paths.PathError as exc:
+            raise ApiError(400, exc.code, exc.message) from None
+        specs.append((relpath, sha, paths.kind_of(relpath)))
+    if len({spec[0] for spec in specs}) != len(specs):
+        raise ApiError(400, "invalid_request", "Los relpath de un enlace deben ser distintos")
+    return specs
+
+
 def validate_create(body):
     if not isinstance(body, dict):
         raise ApiError(400, "invalid_request", "El cuerpo debe ser un objeto JSON")
     extra = set(body) - ALLOWED_FIELDS
     if extra:
         raise ApiError(400, "invalid_request", f"Campos no permitidos: {', '.join(sorted(extra))}")
-    sha = body.get("sha256")
-    if sha is not None and (not isinstance(sha, str) or not SHA_RE.match(sha)):
-        raise ApiError(400, "invalid_request", "sha256 debe ser hexadecimal en minúsculas de 64 caracteres")
+    if "files" not in body:
+        raise ApiError(400, "invalid_request", "Falta el campo files")
     return {
-        "relpath": _text(body, "relpath", 1024, required=True),
-        "sha256": sha,
+        "specs": _file_specs(body["files"]),
         "ttl": _integer(body, "ttl_seconds", 3600, 60, 604800),
         "max_downloads": _integer(body, "max_downloads", 1, 1, 20),
         "created_by": _text(body, "created_by", 64, required=True),
@@ -79,14 +100,22 @@ def validate_create(body):
 def record(link, ctx):
     return {
         "id": link["id"],
-        "filename": link["filename"],
-        "relpath": link["relpath"],
-        "size_bytes": link["size_bytes"],
-        "sha256": link["sha256"],
+        "files": [
+            {
+                "index": item["idx"],
+                "filename": item["filename"],
+                "relpath": item["relpath"],
+                "kind": item["kind"],
+                "size_bytes": item["size_bytes"],
+                "sha256": item["sha256"],
+                "downloads_completed": item["downloads_completed"],
+                "state": item["state"],
+            }
+            for item in link["files"]
+        ],
         "created_at": iso_utc(link["created_at"]),
         "expires_at": iso_utc(link["expires_at"]),
         "max_downloads": link["max_downloads"],
-        "downloads_completed": link["downloads_completed"],
         "state": link["state"],
         "created_by": link["created_by"],
         "job_id": link["job_id"],
@@ -135,30 +164,30 @@ async def create_link(request):
     params = validate_create(body)
 
     def validator():
-        try:
-            return paths.resolve_dump(ctx.config.dumps_root, params["relpath"])[1]
-        except paths.PathError as exc:
-            status = 404 if exc.code == "file_not_found" else 400
-            raise ApiError(status, exc.code, exc.message) from None
-
-    def create():
-        def checked():
-            size = validator()
+        sizes = []
+        for relpath, _, _ in params["specs"]:
+            try:
+                size = paths.resolve_dump(ctx.config.dumps_root, relpath)[1]
+            except paths.PathError as exc:
+                status = 404 if exc.code == "file_not_found" else 400
+                raise ApiError(status, exc.code, exc.message) from None
             if size < 1:
                 raise ApiError(400, "invalid_request", "El archivo está vacío")
-            return size
+            sizes.append(size)
+        return sizes
 
+    def create():
         token = tokens.new_token()
         link = ctx.store.create_link(
-            checked, tokens.hash_token(token), params["relpath"], params["ttl"],
-            params["max_downloads"], params["sha256"], params["created_by"],
-            params["job_id"], params["label"], ctx.now(),
+            validator, tokens.hash_token(token), params["specs"], params["ttl"], params["max_downloads"],
+            params["created_by"], params["job_id"], params["label"], ctx.now(),
         )
         return token, link
 
     token, link = await ctx.db(create)
     ip, ua = client_info(request)
-    ctx.audit.log("link_created", link["id"], ip, ua, link["size_bytes"])
+    ctx.audit.log("link_created", link["id"], ip, ua, sum(f["size_bytes"] for f in link["files"]),
+                  files=len(link["files"]))
     data = record(link, ctx)
     data["url"] = f"{ctx.config.public_base_url}/d/{token}"
     return web.json_response(data, status=201)
@@ -201,7 +230,8 @@ async def revoke_link(request):
         ip, ua = client_info(request)
         ctx.audit.log("link_revoked", link["id"], ip, ua)
     if not keep:
-        await ctx.db(cleanup.delete_finished, ctx, link["relpath"], now, "link_revoked")
+        for item in link["files"]:
+            await ctx.db(cleanup.delete_finished, ctx, item["relpath"], now, "link_revoked")
     return web.Response(status=204)
 
 
@@ -220,9 +250,9 @@ def create_app(ctx):
     app = web.Application(middlewares=[errors, auth], client_max_size=16 * 1024)
     app[CTX] = ctx
     app.on_response_prepare.append(_server_header)
-    app.router.add_post("/v1/links", create_link)
-    app.router.add_get("/v1/links", list_links)
-    app.router.add_get("/v1/links/{id}", get_link)
-    app.router.add_delete("/v1/links/{id}", revoke_link)
-    app.router.add_get("/v1/health", health)
+    app.router.add_post("/v2/links", create_link)
+    app.router.add_get("/v2/links", list_links)
+    app.router.add_get("/v2/links/{id}", get_link)
+    app.router.add_delete("/v2/links/{id}", revoke_link)
+    app.router.add_get("/v2/health", health)
     return app

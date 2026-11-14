@@ -9,9 +9,12 @@ Umbrales de aprobación (exit 0 solo si todos pasan):
   - downloads_completed == 1 y un solo download_completed en la auditoría
   - crecimiento del pico RSS (VmHWM) durante el streaming <= 15 MB (el archivo pesa ~30 MB)
   - SIGTERM termina el proceso con código 0 en <= 8 s
-  - un lector lento no acapara más de 2 streams de un mismo enlace (el tercero recibe 503), otro enlace
-    sigue sirviendo íntegro, y revocar corta los streams lentos y luego borra el archivo
+  - un enlace de 2 archivos con lectores lentos no pasa de 2 streams en total (503 al tercero), otro enlace
+    sigue sirviendo íntegro, y revocar corta los streams lentos y luego borra los dos archivos
   - permisos: data dir 0700 y gateway.db/-wal/-shm/audit.jsonl en 0600
+  - enlace de 2 archivos (dump + zip de `_gitlab`): descarga en paralelo de ambos con sha256 correcto, conteo
+    por archivo, estado `exhausted` solo al agotar los dos, y el dump agotado se borra mientras el zip sigue
+    sirviendo
   - ciclo de vida (gracia y limpieza de 1-2 s por entorno): el dump se borra tras revocar, tras expirar y
     tras agotar (solo después de la gracia), el dump grande se borra tras su descarga, un enlace activo
     y `keep_file=1` conservan el archivo, y la auditoría registra `file_deleted` con su `reason`
@@ -98,8 +101,9 @@ async def lifecycle(http, pub, internal, auth, dumps, data, big_path):
     api = f"http://127.0.0.1:{internal}"
 
     async def new_link(path, **extra):
-        body = {"relpath": "srv/" + os.path.basename(path), "created_by": "eval", "job_id": "eval-lc", **extra}
-        async with http.post(f"{api}/v1/links", headers=auth, json=body) as resp:
+        body = {"files": [{"relpath": "srv/" + os.path.basename(path)}], "created_by": "eval", "job_id": "eval-lc",
+                **extra}
+        async with http.post(f"{api}/v2/links", headers=auth, json=body) as resp:
             return await resp.json()
 
     async def post(link):
@@ -113,13 +117,13 @@ async def lifecycle(http, pub, internal, auth, dumps, data, big_path):
     revocado = small_dump(dumps, "revocado.sql.gz")
     link = await new_link(revocado)
     await post(link)
-    async with http.delete(f"{api}/v1/links/{link['id']}", headers=auth) as resp:
+    async with http.delete(f"{api}/v2/links/{link['id']}", headers=auth) as resp:
         out["revoke_status"] = resp.status
     out["revoke_deleted"] = await wait_gone(revocado, 2)
 
     conservado = small_dump(dumps, "conservado.sql.gz")
     link = await new_link(conservado)
-    async with http.delete(f"{api}/v1/links/{link['id']}?keep_file=1", headers=auth) as resp:
+    async with http.delete(f"{api}/v2/links/{link['id']}?keep_file=1", headers=auth) as resp:
         out["keep_status"] = resp.status
 
     expirado = small_dump(dumps, "expirado.sql.gz")
@@ -145,6 +149,69 @@ async def lifecycle(http, pub, internal, auth, dumps, data, big_path):
     out["big_deleted"] = await wait_gone(big_path, WAIT_GONE_S + GRACE)
     out["active_kept"] = os.path.exists(activo)
     out["keep_kept"] = os.path.exists(conservado)
+    return out
+
+
+async def two_file_case(http, pub, internal, auth, dumps):
+    """Enlace de dump + zip: descarga paralela, conteo por archivo y borrado del archivo agotado primero."""
+    api = f"http://127.0.0.1:{internal}"
+    os.makedirs(os.path.join(dumps, "_gitlab"), mode=0o700, exist_ok=True)
+
+    def make(rel, size):
+        path = os.path.join(dumps, rel)
+        data = os.urandom(size)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        os.chmod(path, 0o600)
+        return path, data
+
+    async def new(files):
+        async with http.post(f"{api}/v2/links", headers=auth, json={
+                "files": [{"relpath": rel, "sha256": hashlib.sha256(data).hexdigest()} for rel, data in files],
+                "created_by": "eval", "job_id": "eval-2f"}) as resp:
+            return await resp.json()
+
+    async def session(link, index):
+        token = link["url"].rsplit("/d/", 1)[1]
+        async with http.post(f"http://127.0.0.1:{pub}/d/{token}/{index}", allow_redirects=False) as resp:
+            return f"http://127.0.0.1:{pub}{resp.headers['Location']}"
+
+    async def get(url):
+        async with http.get(url) as resp:
+            return resp.status, await resp.read()
+
+    async def record(link):
+        async with http.get(f"{api}/v2/links/{link['id']}", headers=auth) as resp:
+            return await resp.json()
+
+    out = {}
+    p1, d1 = make("srv/par1.sql.gz", 3 * 1024 * 1024)
+    p2, d2 = make("_gitlab/par1.zip", 2 * 1024 * 1024 + 7)
+    link = await new([("srv/par1.sql.gz", d1), ("_gitlab/par1.zip", d2)])
+    out["kinds"] = [f["kind"] for f in link["files"]]
+    loc0, loc1 = await session(link, 0), await session(link, 1)
+    (s0, b0), (s1, b1) = await asyncio.gather(get(loc0), get(loc1))
+    out["parallel_ok"] = s0 == s1 == 200 and b0 == d1 and b1 == d2
+    for _ in range(50):
+        rec = await record(link)
+        if rec["state"] == "exhausted":
+            break
+        await asyncio.sleep(0.1)
+    out["counts"] = [f["downloads_completed"] for f in rec["files"]]
+    out["state_both"] = rec["state"]
+    out["both_deleted"] = await wait_gone(p1) and await wait_gone(p2)
+
+    p3, d3 = make("srv/par2.sql.gz", 1024 * 1024)
+    p4, d4 = make("_gitlab/par2.zip", 1024 * 1024)
+    link = await new([("srv/par2.sql.gz", d3), ("_gitlab/par2.zip", d4)])
+    loc0, loc1 = await session(link, 0), await session(link, 1)
+    status, body = await get(loc0)
+    out["first_ok"] = status == 200 and body == d3
+    out["state_partial"] = (await record(link))["state"]
+    out["dump_deleted_first"] = await wait_gone(p3)
+    out["zip_kept"] = os.path.exists(p4)
+    status, body = await get(loc1)
+    out["zip_still_serves"] = status == 200 and body == d4
     return out
 
 
@@ -175,45 +242,50 @@ def spawn(tmp, name):
 
 
 async def slow_reader_case(tmp):
-    """Un lector lento no acapara más de 2 streams de un enlace; otro enlace sigue y revocar corta."""
+    """Un enlace de 2 archivos con lectores lentos no pasa de 2 streams en total; otro enlace sigue y revocar corta."""
     proc, dumps, pub, internal = spawn(tmp, "lento")
     auth = {"Authorization": f"Bearer {API_TOKEN}"}
     out = {}
     try:
-        if not await wait_ready(f"http://127.0.0.1:{internal}/v1/health", auth):
+        if not await wait_ready(f"http://127.0.0.1:{internal}/v2/health", auth):
             raise RuntimeError("el gateway lento no arrancó")
-        big = os.path.join(dumps, "srv", "lento.sql.gz")
-        with open(big, "wb") as fh:
-            fh.truncate(256 * 1024 * 1024)
-        os.chmod(big, 0o600)
+        os.makedirs(os.path.join(dumps, "_gitlab"), mode=0o700, exist_ok=True)
+        bigs = [os.path.join(dumps, "srv", "lento.sql.gz"), os.path.join(dumps, "_gitlab", "lento.zip")]
+        for big in bigs:
+            with open(big, "wb") as fh:
+                fh.truncate(256 * 1024 * 1024)
+            os.chmod(big, 0o600)
         other = small_dump(dumps, "otro.sql.gz")
         payload = open(other, "rb").read()
         async with aiohttp.ClientSession() as http:
-            async def link(name):
-                async with http.post(f"http://127.0.0.1:{internal}/v1/links", headers=auth, json={
-                        "relpath": f"srv/{name}", "created_by": "eval", "job_id": "eval-slow",
-                        "max_downloads": 5}) as resp:
+            async def link(files):
+                async with http.post(f"http://127.0.0.1:{internal}/v2/links", headers=auth, json={
+                        "files": [{"relpath": rel} for rel in files], "created_by": "eval",
+                        "job_id": "eval-slow", "max_downloads": 5}) as resp:
                     return await resp.json()
 
-            async def session(item):
-                path = "/d/" + item["url"].rsplit("/d/", 1)[1]
-                async with http.post(f"http://127.0.0.1:{pub}{path}", allow_redirects=False) as resp:
+            async def session(item, index):
+                token = item["url"].rsplit("/d/", 1)[1]
+                async with http.post(f"http://127.0.0.1:{pub}/d/{token}/{index}", allow_redirects=False) as resp:
                     return f"http://127.0.0.1:{pub}{resp.headers['Location']}"
 
-            a, b = await link("lento.sql.gz"), await link("otro.sql.gz")
-            loc_a, loc_b = await session(a), await session(b)
+            a = await link(["srv/lento.sql.gz", "_gitlab/lento.zip"])
+            b = await link(["srv/otro.sql.gz"])
+            loc_a0, loc_a1, loc_b = await session(a, 0), await session(a, 1), await session(b, 0)
             readers = []
-            for _ in range(2):
-                resp = await http.get(loc_a)
+            for loc in (loc_a0, loc_a1):
+                resp = await http.get(loc)
                 await resp.content.readexactly(1)
                 readers.append(resp)
-            async with http.get(loc_a) as resp:
-                out["third_status"] = resp.status
-                out["third_retry_after"] = "Retry-After" in resp.headers
+            statuses = []
+            for loc in (loc_a0, loc_a1):
+                async with http.get(loc) as resp:
+                    statuses.append((resp.status, "Retry-After" in resp.headers))
+            out["extra_statuses"] = statuses
             async with http.get(loc_b) as resp:
                 out["other_status"] = resp.status
                 out["other_ok"] = await resp.read() == payload
-            async with http.delete(f"http://127.0.0.1:{internal}/v1/links/{a['id']}", headers=auth) as resp:
+            async with http.delete(f"http://127.0.0.1:{internal}/v2/links/{a['id']}", headers=auth) as resp:
                 out["revoke_status"] = resp.status
             cut = 0
             for resp in readers:
@@ -229,7 +301,7 @@ async def slow_reader_case(tmp):
                 cut += got < 256 * 1024 * 1024
                 resp.close()
             out["readers_cut"] = cut
-            out["slow_file_deleted"] = await wait_gone(big)
+            out["slow_files_deleted"] = await wait_gone(bigs[0]) and await wait_gone(bigs[1])
     finally:
         proc.send_signal(signal.SIGTERM)
         try:
@@ -270,13 +342,13 @@ async def run(tmp):
     results = {}
     auth = {"Authorization": f"Bearer {API_TOKEN}"}
     try:
-        if not await wait_ready(f"http://127.0.0.1:{internal}/v1/health", auth):
+        if not await wait_ready(f"http://127.0.0.1:{internal}/v2/health", auth):
             raise RuntimeError("el gateway no arrancó")
         async with aiohttp.ClientSession() as http:
             async with http.post(
-                f"http://127.0.0.1:{internal}/v1/links", headers=auth,
-                json={"relpath": "srv/grande.sql.gz", "created_by": "eval", "job_id": "eval-1",
-                      "sha256": digest.hexdigest()},
+                f"http://127.0.0.1:{internal}/v2/links", headers=auth,
+                json={"files": [{"relpath": "srv/grande.sql.gz", "sha256": digest.hexdigest()}],
+                      "created_by": "eval", "job_id": "eval-1"},
             ) as resp:
                 link = await resp.json()
             path = link["url"].split(f":{pub}", 1)[1]
@@ -310,15 +382,16 @@ async def run(tmp):
             joined = hashlib.sha256()
             for _, body in sorted(chunks):
                 joined.update(body)
-            async with http.get(f"http://127.0.0.1:{internal}/v1/links/{link['id']}", headers=auth) as resp:
+            async with http.get(f"http://127.0.0.1:{internal}/v2/links/{link['id']}", headers=auth) as resp:
                 state = await resp.json()
             results["sha256_ok"] = joined.hexdigest() == digest.hexdigest()
-            results["downloads_completed"] = state["downloads_completed"]
+            results["downloads_completed"] = state["files"][0]["downloads_completed"]
             results["rss_growth_mb"] = round(peak - baseline, 1)
             results["duration_s"] = round(elapsed, 2)
             results["throughput_mb_s"] = round(SIZE / 1048576 / elapsed, 1)
             results["lifecycle"] = await lifecycle(http, pub, internal, auth, dumps, data, payload_path)
             results["modes"] = file_modes(data)
+            results["two"] = await two_file_case(http, pub, internal, auth, dumps)
     finally:
         proc.send_signal(signal.SIGTERM)
         started = time.monotonic()
@@ -359,14 +432,26 @@ def main():
     ]
     sl, modes = res["slow"], res["modes"]
     checks += [
-        ("lector lento: el tercer stream del mismo enlace recibe 503 con Retry-After",
-         sl["third_status"] == 503 and sl["third_retry_after"]),
+        ("lectores lentos: un enlace de 2 archivos no pasa de 2 streams en total (503 con Retry-After en ambos)",
+         sl["extra_statuses"] == [(503, True), (503, True)]),
         ("lector lento: otro enlace sigue sirviendo íntegro", sl["other_status"] == 200 and sl["other_ok"]),
         ("revocar corta los dos streams lentos", sl["revoke_status"] == 204 and sl["readers_cut"] == 2),
-        ("revocar borra luego el archivo del lector lento", sl["slow_file_deleted"]),
+        ("revocar borra luego los dos archivos del enlace lento", sl["slow_files_deleted"]),
         ("data dir 0700", modes["data_dir"] == 0o700),
         ("gateway.db, -wal, -shm y audit.jsonl en 0600",
          all(v == 0o600 for k, v in modes.items() if k != "data_dir") and "gateway.db-wal" in modes),
+    ]
+    two = res["two"]
+    checks += [
+        ("2 archivos: tipos db y code derivados del sufijo", two["kinds"] == ["db", "code"]),
+        ("2 archivos: descarga paralela íntegra (sha256 de cada uno)", two["parallel_ok"]),
+        ("2 archivos: conteo por archivo [1, 1] y enlace exhausted", two["counts"] == [1, 1]
+         and two["state_both"] == "exhausted"),
+        ("2 archivos: al agotar ambos se borran los dos", two["both_deleted"]),
+        ("2 archivos: con un solo archivo agotado el enlace sigue activo", two["state_partial"] == "active"
+         and two["first_ok"]),
+        ("2 archivos: el dump agotado se borra y el zip sigue ahí", two["dump_deleted_first"] and two["zip_kept"]),
+        ("2 archivos: el zip sigue sirviendo íntegro tras borrar el dump", two["zip_still_serves"]),
     ]
     lc = res["lifecycle"]
     razones = dict(res["delete_reasons"])

@@ -22,3 +22,6 @@ dumps/
 data/
 *.part
 *.lock
+
+# Catálogo real de proyectos (la plantilla es deploy/projects.example.json)
+/projects.json

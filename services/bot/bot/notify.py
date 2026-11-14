@@ -7,10 +7,12 @@ import asyncio
 import logging
 
 from . import flow
+from .packages import PackageOutcome
 
 log = logging.getLogger("bot.notify")
-CANCEL_NOTICE_TIMEOUT = 3
-RETRY_DELAYS = (1.0, 3.0)
+CANCEL_NOTICE_TIMEOUT = 2
+RETRY_DELAYS = (1, 3)
+CANCEL_RETRY_DELAYS = (0.3, 0.6)
 
 
 async def _attempt(coro, what):
@@ -24,24 +26,38 @@ async def _attempt(coro, what):
         return False
 
 
-async def _send_with_retry(sink, view):
-    """Un fallo de red no debe perder el único aviso con el enlace: se reintenta con espera."""
-    for delay in (0.0, *RETRY_DELAYS):
-        if delay:
-            await asyncio.sleep(delay)
+async def _send_with_retries(sink, view, delays):
+    """Un intento más un reintento por cada espera de `delays`; el aviso con el enlace es único."""
+    for attempt in range(len(delays) + 1):
+        if attempt:
+            await asyncio.sleep(delays[attempt - 1])
         if await _attempt(sink.send(view.text, view.keyboard), "enviar el aviso final"):
             return True
     return False
 
 
-async def _finish(sink, kind, req, view):
+async def _finish(sink, kind, req, view, delays):
     """Aviso nuevo (genera push) y progreso editado a un estado corto, sin enlace ni detalle aunque el aviso falle."""
-    sent = await _send_with_retry(sink, view)
+    sent = await _send_with_retries(sink, view, delays)
     await _attempt(sink.edit(flow.fmt_progress_done(kind, req, sent)), "editar el progreso")
 
 
-async def report_job(jobs, req, job_id, sink, now=None):
+def _view_for(outcome, req, now):
+    if isinstance(outcome, PackageOutcome):
+        return flow.fmt_package_result(outcome, req, now), outcome.kind
+    if outcome.kind == "ok":
+        view = flow.fmt_job_success(outcome, req, now)
+    elif outcome.kind == "link_failed":
+        view = flow.fmt_job_link_failure(outcome)
+    else:
+        view = flow.fmt_job_failure(outcome, req)
+    return view, ("cancelled" if outcome.code == "E_CANCELLED" else outcome.kind)
+
+
+async def report_job(jobs, req, job_id, sink, now=None, delays=None):
     """Corre el job y avisa. `sink.edit(text, keyboard=None)` edita el progreso; `sink.send(text, keyboard)` envía un mensaje nuevo."""
+
+    delays = RETRY_DELAYS if delays is None else delays
 
     async def queued(position):
         await sink.edit(flow.fmt_queued(position))
@@ -52,16 +68,9 @@ async def report_job(jobs, req, job_id, sink, now=None):
     try:
         outcome = await jobs.run(req, job_id, on_queued=queued, on_start=started)
     except asyncio.CancelledError:
-        view = flow.fmt_job_cancelled(req)
-        with_timeout = asyncio.wait_for(_finish(sink, "cancelled", req, view), CANCEL_NOTICE_TIMEOUT)
-        await _attempt(with_timeout, "avisar la cancelación")
+        cancelled = _finish(sink, "cancelled", req, flow.fmt_job_cancelled(req), CANCEL_RETRY_DELAYS if delays else ())
+        await _attempt(asyncio.wait_for(cancelled, CANCEL_NOTICE_TIMEOUT), "avisar la cancelación")
         raise
-    if outcome.kind == "ok":
-        view = flow.fmt_job_success(outcome, req, now)
-    elif outcome.kind == "link_failed":
-        view = flow.fmt_job_link_failure(outcome)
-    else:
-        view = flow.fmt_job_failure(outcome, req)
-    kind = "cancelled" if outcome.code == "E_CANCELLED" else outcome.kind
-    await _finish(sink, kind, req, view)
+    view, kind = _view_for(outcome, req, now)
+    await _finish(sink, kind, req, view, delays)
     return outcome

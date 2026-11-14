@@ -27,6 +27,7 @@ class Config:
     job_timeout: int
     max_jobs: int
     telegram_api_base: str | None
+    gitlab_fetch: str = "/app/gitlab/fetch.py"
 
 
 def _int(env, name, default, lo, hi):
@@ -82,6 +83,7 @@ def load_config(env=None) -> Config:
         job_timeout=_int(env, "BOT_JOB_TIMEOUT_SECONDS", 1800, 10, 86400),
         max_jobs=_int(env, "BOT_MAX_JOBS", 1, 1, 8),
         telegram_api_base=api_base,
+        gitlab_fetch=env.get("BOT_GITLAB_FETCH", "").strip() or "/app/gitlab/fetch.py",
     )
 
 

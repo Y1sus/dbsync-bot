@@ -1,70 +1,267 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://dbsync-bot/contracts/link.schema.json",
-  "$comment": "Contrato bot <-> gateway (API interna v1). Autor: Jesús Montalvo <jmontalvo_m@outlook.com>. Un cambio incompatible incrementa la versión de la ruta (/v2) y se actualizan gateway y bot a la vez.",
+  "$comment": "Contrato bot <-> gateway (API interna v2, enlaces multi-archivo). Autor: Jesús Montalvo <jmontalvo_m@outlook.com>. Un cambio incompatible incrementa la versión de la ruta y se actualizan gateway y bot a la vez.",
   "title": "Gateway internal API",
   "$defs": {
-    "iso_utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+    "iso_utc": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
     "LinkCreateRequest": {
       "type": "object",
-      "required": ["relpath", "created_by", "job_id"],
+      "required": [
+        "files",
+        "created_by",
+        "job_id"
+      ],
       "additionalProperties": false,
       "properties": {
-        "relpath": { "type": "string", "description": "<servidor>/<archivo>.sql.gz relativo a la raíz de dumps; sin '..', sin '/' inicial." },
-        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Lo entrega el runner; el gateway no recalcula (1 vCPU)." },
-        "ttl_seconds": { "type": "integer", "minimum": 60, "maximum": 604800, "default": 3600 },
-        "max_downloads": { "type": "integer", "minimum": 1, "maximum": 20, "default": 1 },
-        "created_by": { "type": "string", "maxLength": 64 },
-        "job_id": { "type": "string", "maxLength": 64 },
-        "label": { "type": "string", "maxLength": 120 }
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/$defs/FileSpec"
+          },
+          "description": "Archivos del enlace; relpath distintos entre sí."
+        },
+        "ttl_seconds": {
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 604800,
+          "default": 3600
+        },
+        "max_downloads": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 20,
+          "default": 1,
+          "description": "Descargas permitidas POR ARCHIVO."
+        },
+        "created_by": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "job_id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 120
+        }
       }
     },
     "LinkRecord": {
       "type": "object",
-      "required": ["id", "filename", "relpath", "size_bytes", "created_at", "expires_at", "max_downloads", "downloads_completed", "state", "created_by", "job_id", "download_in_progress"],
+      "required": [
+        "id",
+        "files",
+        "created_at",
+        "expires_at",
+        "max_downloads",
+        "state",
+        "created_by",
+        "job_id",
+        "download_in_progress"
+      ],
       "properties": {
-        "id": { "type": "string", "pattern": "^[0-9a-f]{12}$", "description": "Identificador público para listar y revocar. NO es el token." },
-        "filename": { "type": "string" },
-        "relpath": { "type": "string" },
-        "size_bytes": { "type": "integer", "minimum": 1 },
-        "sha256": { "type": ["string", "null"] },
-        "created_at": { "$ref": "#/$defs/iso_utc" },
-        "expires_at": { "$ref": "#/$defs/iso_utc" },
-        "max_downloads": { "type": "integer" },
-        "downloads_completed": { "type": "integer" },
-        "state": { "enum": ["active", "expired", "exhausted", "revoked"] },
-        "created_by": { "type": "string" },
-        "job_id": { "type": "string" },
-        "label": { "type": ["string", "null"] },
-        "download_in_progress": { "type": "boolean" }
+        "id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{12}$",
+          "description": "Identificador público para listar y revocar. NO es el token."
+        },
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/$defs/LinkFile"
+          }
+        },
+        "created_at": {
+          "$ref": "#/$defs/iso_utc"
+        },
+        "expires_at": {
+          "$ref": "#/$defs/iso_utc"
+        },
+        "max_downloads": {
+          "type": "integer",
+          "description": "Por archivo."
+        },
+        "state": {
+          "enum": [
+            "active",
+            "expired",
+            "exhausted",
+            "revoked"
+          ],
+          "description": "exhausted solo cuando TODOS los archivos están agotados."
+        },
+        "created_by": {
+          "type": "string"
+        },
+        "job_id": {
+          "type": "string"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "download_in_progress": {
+          "type": "boolean"
+        }
       }
     },
     "LinkCreated": {
-      "allOf": [ { "$ref": "#/$defs/LinkRecord" } ],
-      "required": ["url"],
-      "properties": { "url": { "type": "string", "description": "<PUBLIC_BASE_URL>/d/<token>. El token solo se devuelve aquí; el gateway guarda su hash." } }
+      "allOf": [
+        {
+          "$ref": "#/$defs/LinkRecord"
+        }
+      ],
+      "required": [
+        "url"
+      ],
+      "properties": {
+        "url": {
+          "type": "string",
+          "description": "<PUBLIC_BASE_URL>/d/<token>. El token solo se devuelve aquí; el gateway guarda su hash."
+        }
+      }
     },
     "LinkList": {
       "type": "object",
-      "required": ["links"],
-      "properties": { "links": { "type": "array", "items": { "$ref": "#/$defs/LinkRecord" } } }
+      "required": [
+        "links"
+      ],
+      "properties": {
+        "links": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LinkRecord"
+          }
+        }
+      }
     },
     "Health": {
       "type": "object",
-      "required": ["ok", "links_active", "disk_free_mb"],
-      "properties": { "ok": { "const": true }, "links_active": { "type": "integer" }, "disk_free_mb": { "type": "integer" } }
+      "required": [
+        "ok",
+        "links_active",
+        "disk_free_mb"
+      ],
+      "properties": {
+        "ok": {
+          "const": true
+        },
+        "links_active": {
+          "type": "integer"
+        },
+        "disk_free_mb": {
+          "type": "integer"
+        }
+      }
     },
     "Error": {
       "type": "object",
-      "required": ["error"],
+      "required": [
+        "error"
+      ],
       "properties": {
         "error": {
           "type": "object",
-          "required": ["code", "message"],
+          "required": [
+            "code",
+            "message"
+          ],
           "properties": {
-            "code": { "enum": ["invalid_request", "unauthorized", "file_not_found", "not_found", "internal"] },
-            "message": { "type": "string" }
+            "code": {
+              "enum": [
+                "invalid_request",
+                "unauthorized",
+                "file_not_found",
+                "not_found",
+                "internal"
+              ]
+            },
+            "message": {
+              "type": "string"
+            }
           }
+        }
+      }
+    },
+    "FileSpec": {
+      "type": "object",
+      "required": [
+        "relpath"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "relpath": {
+          "type": "string",
+          "description": "<fuente>/<archivo> relativo a la raíz de datos, exactamente dos componentes (fuente = servidor de BD o _gitlab); sufijo .sql.gz (BD), .zip o .tar.gz (código); sin '..', sin '/' inicial, sin ocultos."
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Lo entrega el productor (runner o servicio de GitLab); el gateway no recalcula (1 vCPU)."
+        }
+      }
+    },
+    "LinkFile": {
+      "type": "object",
+      "required": [
+        "index",
+        "filename",
+        "relpath",
+        "kind",
+        "size_bytes",
+        "downloads_completed",
+        "state"
+      ],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        "filename": {
+          "type": "string"
+        },
+        "relpath": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "db",
+            "code"
+          ],
+          "description": "Derivado del sufijo: .sql.gz -> db; .zip y .tar.gz -> code."
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "downloads_completed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "state": {
+          "enum": [
+            "active",
+            "exhausted"
+          ],
+          "description": "exhausted cuando downloads_completed >= max_downloads del enlace."
         }
       }
     }

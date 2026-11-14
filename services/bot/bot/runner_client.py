@@ -18,6 +18,9 @@ RUNNER_CODES = (
     "E_LOCKED", "E_SSH", "E_DUMP_FAILED", "E_TRUNCATED", "E_DISK", "E_INTERNAL",
 )
 STDERR_TAIL_LINES = 15
+STDOUT_MAX = 1024 * 1024
+STDERR_MAX = 256 * 1024
+READ_CHUNK = 65536
 log = logging.getLogger("bot.runner")
 
 
@@ -108,11 +111,48 @@ def validate_result(result, command):
     return result
 
 
+class _Overflow(Exception):
+    def __init__(self, name, limit):
+        super().__init__(name)
+        self.name, self.limit = name, limit
+
+
+async def _read_capped(stream, limit, name):
+    """Acumula hasta `limit` bytes; al pasarse corta sin guardar más."""
+    buf = bytearray()
+    while True:
+        chunk = await stream.read(READ_CHUNK)
+        if not chunk:
+            return bytes(buf)
+        buf += chunk
+        if len(buf) > limit:
+            raise _Overflow(name, limit)
+
+
+async def _collect(proc):
+    readers = [asyncio.ensure_future(_read_capped(proc.stdout, STDOUT_MAX, "stdout")),
+               asyncio.ensure_future(_read_capped(proc.stderr, STDERR_MAX, "stderr"))]
+    try:
+        out, err = await asyncio.gather(*readers)
+        await proc.wait()
+        return out, err
+    finally:
+        for r in readers:
+            r.cancel()
+        await asyncio.gather(*readers, return_exceptions=True)
+
+
 def _tail(text, lines=STDERR_TAIL_LINES):
     return "\n".join(text.strip().splitlines()[-lines:])
 
 
 class RunnerClient:
+    label = "el runner"
+
+    @property
+    def label_cap(self):
+        return self.label[0].upper() + self.label[1:]
+
     def __init__(self, path, timeout=1800, env=None, kill_grace=3.0, redactor=str):
         self.path = path
         self.timeout = timeout
@@ -120,6 +160,12 @@ class RunnerClient:
         self.kill_grace = kill_grace
         self._redact = redactor
         self._procs = set()
+
+    def _argv(self, args):
+        return [self.path, *args]
+
+    def _validate(self, result, command):
+        return validate_result(result, command)
 
     def _environment(self):
         merged = dict(os.environ)
@@ -153,7 +199,7 @@ class RunnerClient:
         timeout = self.timeout if timeout is None else timeout
         try:
             proc = await asyncio.create_subprocess_exec(
-                self.path, *args,
+                *self._argv(args),
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -161,14 +207,20 @@ class RunnerClient:
                 start_new_session=True,
             )
         except OSError as exc:
-            raise RunnerError("E_RUNNER_START", f"No se pudo ejecutar el runner: {exc.strerror}.") from None
+            raise RunnerError("E_RUNNER_START", f"No se pudo ejecutar {self.label}: {exc.strerror}.") from None
         self._procs.add(proc)
         try:
             try:
-                out, err = await asyncio.wait_for(proc.communicate(), timeout)
+                out, err = await asyncio.wait_for(_collect(proc), timeout)
+            except _Overflow as exc:
+                await self._terminate(proc)
+                raise RunnerError(
+                    "E_BAD_OUTPUT",
+                    f"{self.label_cap} produjo demasiada salida por {exc.name} (más de {exc.limit // 1024} KiB) y se canceló.",
+                ) from None
             except asyncio.TimeoutError:
                 await self._terminate(proc)
-                raise RunnerError("E_TIMEOUT", f"El runner superó el límite de {int(timeout)} s.") from None
+                raise RunnerError("E_TIMEOUT", f"{self.label_cap} superó el límite de {int(timeout)} s.") from None
             except asyncio.CancelledError:
                 await asyncio.shield(self._terminate(proc))
                 raise
@@ -190,14 +242,14 @@ class RunnerClient:
     def _parse_json(self, code, stdout, command):
         lines = [l for l in stdout.splitlines() if l.strip()]
         if not lines:
-            raise RunnerError("E_BAD_OUTPUT", f"El runner no devolvió respuesta (salida {code}).")
+            raise RunnerError("E_BAD_OUTPUT", f"{self.label_cap} no devolvió respuesta (salida {code}).")
         try:
             result = json.loads(lines[-1])
         except ValueError:
-            raise RunnerError("E_BAD_OUTPUT", f"El runner devolvió una respuesta ilegible (salida {code}).") from None
-        validate_result(result, command)
+            raise RunnerError("E_BAD_OUTPUT", f"{self.label_cap} devolvió una respuesta ilegible (salida {code}).") from None
+        self._validate(result, command)
         if code != 0:
-            raise RunnerError("E_BAD_OUTPUT", f"El runner reportó éxito con salida {code}.")
+            raise RunnerError("E_BAD_OUTPUT", f"{self.label_cap} reportó éxito con salida {code}.")
         return result
 
     async def servers(self):

@@ -36,8 +36,68 @@ class LimpiezaTests(GatewayCase):
         self.assertEqual(result["files_deleted"], 1)
         self.assertEqual(self.deleted_reasons(), ["retention"])
 
+    async def test_borra_part_viejos_con_audit_stale_part_y_respeta_los_recientes(self):
+        stale = self.ctx.config.stale_part_seconds
+        viejo = self.make("srv/a.sql.gz.part", 0)
+        gitlab_zip = self.make("_gitlab/p.zip.part", 0)
+        gitlab_tgz = self.make("_gitlab/p.tar.gz.part", 0)
+        limite = self.make("srv/limite.sql.gz.part", 0)
+        reciente = self.make("srv/nuevo.sql.gz.part", 0)
+        for path, age in ((viejo, stale + 1), (gitlab_zip, 10 * stale), (gitlab_tgz, stale + 60),
+                          (limite, stale), (reciente, stale - 60)):
+            os.utime(path, (self.clock() - age, self.clock() - age))
+        result = self.run_cleanup()
+        for path in (viejo, gitlab_zip, gitlab_tgz):
+            self.assertFalse(os.path.exists(path), path)
+        for path in (limite, reciente):
+            self.assertTrue(os.path.exists(path), path)
+        events = [e for e in self.audit_events() if e["event"] == "file_deleted" and e["reason"] == "stale_part"]
+        self.assertEqual(sorted(e["relpath"] for e in events),
+                         ["_gitlab/p.tar.gz.part", "_gitlab/p.zip.part", "srv/a.sql.gz.part"])
+        self.assertGreaterEqual(result["files_deleted"], 3)
+        self.clock.advance(61)
+        self.run_cleanup()
+        self.assertFalse(os.path.exists(limite))
+        self.assertFalse(os.path.exists(reciente))
+
+    async def test_part_nunca_toca_symlinks_ocultos_directorios_ni_fuera_de_la_raiz(self):
+        viejo = self.clock() - 100 * HORA
+        fuera = os.path.join(self.tmp.name, "fuera.sql.gz.part")
+        with open(fuera, "wb") as fh:
+            fh.write(b"datos")
+        os.utime(fuera, (viejo, viejo))
+        os.symlink(fuera, os.path.join(self.dumps, "srv", "ln.sql.gz.part"))
+        os.symlink(self.tmp.name, os.path.join(self.dumps, "dirln"))
+        oculto = self.make("srv/.o.sql.gz.part", 100)
+        locks = self.make(".locks/z.sql.gz.part", 100)
+        raiz = os.path.join(self.dumps, "suelto.sql.gz.part")
+        with open(raiz, "wb") as fh:
+            fh.write(b"x")
+        os.utime(raiz, (viejo, viejo))
+        carpeta = os.path.join(self.dumps, "srv", "d.sql.gz.part")
+        os.makedirs(carpeta)
+        os.utime(carpeta, (viejo, viejo))
+        anidado = os.path.join(self.dumps, "srv", "carpeta", "n.sql.gz.part")
+        os.makedirs(os.path.dirname(anidado))
+        with open(anidado, "wb") as fh:
+            fh.write(b"x")
+        os.utime(anidado, (viejo, viejo))
+        self.run_cleanup()
+        for path in (fuera, oculto, locks, raiz, anidado):
+            self.assertTrue(os.path.exists(path), path)
+        self.assertTrue(os.path.islink(os.path.join(self.dumps, "srv", "ln.sql.gz.part")))
+        self.assertTrue(os.path.isdir(carpeta))
+        self.assertEqual([e for e in self.audit_events() if e.get("reason") == "stale_part"], [])
+
+    async def test_umbral_de_part_configurable(self):
+        self.ctx.config = dataclasses.replace(self.ctx.config, stale_part_seconds=60)
+        part = self.make("srv/c.sql.gz.part", 0)
+        os.utime(part, (self.clock() - 61, self.clock() - 61))
+        self.run_cleanup()
+        self.assertFalse(os.path.exists(part))
+
     async def test_nunca_toca_part_locks_symlinks_ni_otros(self):
-        part = self.make("srv/x.sql.gz.part", 100)
+        part = self.make("srv/x.sql.gz.part", 1)
         lock = self.make(".locks/y.sql.gz", 100)
         texto = self.make("srv/z.txt", 100)
         oculto = self.make("srv/.h.sql.gz", 100)
@@ -65,7 +125,7 @@ class LimpiezaTests(GatewayCase):
         link = await self.create_link()
         os.unlink(self.dump_path)
         os.symlink(fuera, self.dump_path)
-        await self.api("DELETE", f"/v1/links/{link['id']}")
+        await self.api("DELETE", f"/v2/links/{link['id']}")
         self.run_cleanup()
         self.assertTrue(os.path.exists(fuera))
         self.assertTrue(os.path.islink(self.dump_path))
@@ -105,10 +165,10 @@ class LimpiezaTests(GatewayCase):
         self.assertIn(("link_expired", link["id"]), events)
         self.assertIn(("link_expired", otro["id"]), events)
         self.assertEqual(self.run_cleanup()["links_closed"], 0)
-        self.assertEqual(len((await self.api("GET", "/v1/links?state=all"))[1]["links"]), 2)
+        self.assertEqual(len((await self.api("GET", "/v2/links?state=all"))[1]["links"]), 2)
         self.clock.advance(7 * 86400 + 1)
         self.assertEqual(self.run_cleanup()["rows_purged"], 2)
-        self.assertEqual((await self.api("GET", "/v1/links?state=all"))[1]["links"], [])
+        self.assertEqual((await self.api("GET", "/v2/links?state=all"))[1]["links"], [])
         self.assertEqual(self.ctx.store._db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 0)
 
 
@@ -183,20 +243,20 @@ class BorradoAlTerminarElEnlaceTests(GatewayCase):
     async def test_revocar_borra_de_inmediato(self):
         link = await self.create_link()
         await self.open_session(link)
-        self.assertEqual((await self.api("DELETE", f"/v1/links/{link['id']}"))[0], 204)
+        self.assertEqual((await self.api("DELETE", f"/v2/links/{link['id']}"))[0], 204)
         self.assertFalse(os.path.exists(self.dump_path))
         self.assertEqual(self.reasons(), ["link_revoked"])
 
     async def test_revocar_con_keep_file_conserva_incluso_tras_la_pasada(self):
         link = await self.create_link()
-        self.assertEqual((await self.api("DELETE", f"/v1/links/{link['id']}?keep_file=1"))[0], 204)
+        self.assertEqual((await self.api("DELETE", f"/v2/links/{link['id']}?keep_file=1"))[0], 204)
         self.run_cleanup()
         self.assertTrue(os.path.exists(self.dump_path))
         self.assertEqual(self.reasons(), [])
 
     async def test_keep_file_cae_en_retencion_cuando_se_purgan_las_filas(self):
         link = await self.create_link()
-        await self.api("DELETE", f"/v1/links/{link['id']}?keep_file=1")
+        await self.api("DELETE", f"/v2/links/{link['id']}?keep_file=1")
         self.clock.advance(7 * 86400 + 1)
         os.utime(self.dump_path, (self.clock() - 30 * HORA, self.clock() - 30 * HORA))
         self.run_cleanup()
@@ -205,25 +265,25 @@ class BorradoAlTerminarElEnlaceTests(GatewayCase):
 
     async def test_delete_sin_keep_file_despues_de_conservar_borra(self):
         link = await self.create_link()
-        await self.api("DELETE", f"/v1/links/{link['id']}?keep_file=1")
+        await self.api("DELETE", f"/v2/links/{link['id']}?keep_file=1")
         self.assertTrue(os.path.exists(self.dump_path))
-        self.assertEqual((await self.api("DELETE", f"/v1/links/{link['id']}"))[0], 204)
+        self.assertEqual((await self.api("DELETE", f"/v2/links/{link['id']}"))[0], 204)
         self.assertFalse(os.path.exists(self.dump_path))
 
     async def test_no_borra_si_otro_enlace_activo_comparte_el_relpath(self):
         a = await self.create_link()
         b = await self.create_link()
-        await self.api("DELETE", f"/v1/links/{a['id']}")
+        await self.api("DELETE", f"/v2/links/{a['id']}")
         self.run_cleanup()
         self.assertTrue(os.path.exists(self.dump_path))
-        await self.api("DELETE", f"/v1/links/{b['id']}")
+        await self.api("DELETE", f"/v2/links/{b['id']}")
         self.assertFalse(os.path.exists(self.dump_path))
 
     async def test_no_borra_con_sesion_abierta_de_otro_enlace_cerrado(self):
         a = await self.create_link(ttl_seconds=60)
         b = await self.create_link(ttl_seconds=60)
         await self.open_session(b)
-        await self.api("DELETE", f"/v1/links/{a['id']}")
+        await self.api("DELETE", f"/v2/links/{a['id']}")
         self.clock.advance(61)
         self.run_cleanup()
         self.assertTrue(os.path.exists(self.dump_path))
@@ -234,7 +294,7 @@ class BorradoAlTerminarElEnlaceTests(GatewayCase):
     async def test_no_borra_con_stream_activo_y_reintenta_en_la_siguiente_pasada(self):
         link = await self.create_link()
         self.ctx.active.enter(link["id"])
-        self.assertEqual((await self.api("DELETE", f"/v1/links/{link['id']}"))[0], 204)
+        self.assertEqual((await self.api("DELETE", f"/v2/links/{link['id']}"))[0], 204)
         self.assertTrue(os.path.exists(self.dump_path))
         self.run_cleanup()
         self.assertTrue(os.path.exists(self.dump_path))
@@ -275,10 +335,10 @@ class BorradoAlTerminarElEnlaceTests(GatewayCase):
 
     async def test_revocar_cerrado_es_idempotente_y_desconocido_404(self):
         link = await self.create_link()
-        self.assertEqual((await self.api("DELETE", f"/v1/links/{link['id']}"))[0], 204)
-        self.assertEqual((await self.api("DELETE", f"/v1/links/{link['id']}"))[0], 204)
-        self.assertEqual((await self.api("DELETE", f"/v1/links/{link['id']}?keep_file=1"))[0], 204)
-        status, data = await self.api("DELETE", "/v1/links/ffffffffffff")
+        self.assertEqual((await self.api("DELETE", f"/v2/links/{link['id']}"))[0], 204)
+        self.assertEqual((await self.api("DELETE", f"/v2/links/{link['id']}"))[0], 204)
+        self.assertEqual((await self.api("DELETE", f"/v2/links/{link['id']}?keep_file=1"))[0], 204)
+        status, data = await self.api("DELETE", "/v2/links/ffffffffffff")
         self.assertEqual((status, data["error"]["code"]), (404, "not_found"))
         events = [e["event"] for e in self.audit_events()]
         self.assertEqual(events.count("link_revoked"), 1)
@@ -288,7 +348,7 @@ class BorradoAlTerminarElEnlaceTests(GatewayCase):
         loc = await self.open_session(link)
         await self.fetch(loc)
         self.assertTrue(os.path.exists(self.dump_path))
-        await self.api("DELETE", f"/v1/links/{link['id']}")
+        await self.api("DELETE", f"/v2/links/{link['id']}")
         self.assertFalse(os.path.exists(self.dump_path))
 
     async def test_create_link_y_borrado_comparten_candado(self):
@@ -296,8 +356,8 @@ class BorradoAlTerminarElEnlaceTests(GatewayCase):
         self.clock.advance(61)
         self.run_cleanup()
         self.assertFalse(os.path.exists(self.dump_path))
-        status, data = await self.api("POST", "/v1/links",
-                                      {"relpath": "srv/a.sql.gz", "created_by": "t", "job_id": "j"})
+        status, data = await self.api("POST", "/v2/links",
+                                      {"files": [{"relpath": "srv/a.sql.gz"}], "created_by": "t", "job_id": "j"})
         self.assertEqual((status, data["error"]["code"]), (404, "file_not_found"))
         del link
 

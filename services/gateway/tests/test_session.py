@@ -41,6 +41,66 @@ class CoberturaHttpTests(GatewayCase):
         await self.idle()
         self.assertEqual((await self.link_state(link))["downloads_completed"], 1)
 
+    async def test_evasion_con_size_menos_uno_cuenta_por_total_enviado(self):
+        link = await self.create_link(max_downloads=3)
+        loc = await self.open_session(link)
+        status, _, body = await self.fetch(loc, "bytes=0-998")
+        self.assertEqual((status, len(body)), (206, 999))
+        await self.idle()
+        self.assertEqual((await self.link_state(link))["downloads_completed"], 0)
+        self.assertEqual(self.session_row()["sent_total"], 999)
+        await self.fetch(loc, "bytes=0-998")
+        state = await self.counted(link)
+        self.assertEqual(state["downloads_completed"], 1)
+        await self.idle()
+        self.assertEqual(self.session_row()["sent_total"], 1998)
+        status, _, _ = await self.fetch(loc, "bytes=0-998")
+        self.assertEqual(status, 410)
+        await self.idle()
+        self.assertEqual((await self.link_state(link))["downloads_completed"], 1)
+
+    async def test_sondas_pequenas_acumuladas_no_cuentan(self):
+        link = await self.create_link()
+        loc = await self.open_session(link)
+        for _ in range(6):
+            await self.fetch(loc, "bytes=-1")
+        await self.fetch(loc, "bytes=0-9")
+        await self.idle()
+        self.assertEqual((await self.link_state(link))["downloads_completed"], 0)
+        self.assertEqual(self.session_row()["sent_total"], 16)
+
+    async def test_reanudacion_del_90_por_ciento_cuenta_una_vez(self):
+        link = await self.create_link(max_downloads=4)
+        loc = await self.open_session(link)
+        await self.fetch(loc, "bytes=0-899")
+        await self.idle()
+        self.assertEqual((await self.link_state(link))["downloads_completed"], 0)
+        await self.fetch(loc, "bytes=900-")
+        self.assertEqual((await self.counted(link))["downloads_completed"], 1)
+        await self.idle()
+        await self.fetch(loc, "bytes=0-899")
+        await self.idle()
+        self.assertEqual((await self.link_state(link))["downloads_completed"], 1)
+
+    async def test_dos_lecturas_de_90_por_ciento_cuentan_por_total(self):
+        link = await self.create_link(max_downloads=4)
+        loc = await self.open_session(link)
+        await self.fetch(loc, "bytes=0-899")
+        await self.fetch(loc, "bytes=0-899")
+        self.assertEqual((await self.counted(link))["downloads_completed"], 1)
+
+    async def test_lecturas_concurrentes_de_size_menos_uno_cuentan_una_y_respetan_el_presupuesto(self):
+        link = await self.create_link(max_downloads=5)
+        loc = await self.open_session(link)
+        results = await asyncio.gather(*[self.fetch(loc, "bytes=0-998") for _ in range(6)])
+        statuses = sorted(r[0] for r in results)
+        self.assertEqual((statuses.count(206), statuses.count(410)), (2, 4))
+        self.assertEqual((await self.counted(link))["downloads_completed"], 1)
+        await self.idle()
+        row = self.session_row()
+        self.assertEqual((row["sent_total"], row["budget_used"], row["counted"]), (1998, 1998, 1))
+        self.assertEqual((await self.link_state(link))["downloads_completed"], 1)
+
     async def test_hueco_de_un_byte_impide_contar(self):
         link = await self.create_link()
         loc = await self.open_session(link)
@@ -188,7 +248,7 @@ class CortesTests(GatewayCase):
         link = await self.create_link()
         loc = await self.open_session(link)
         resp = await self.stream(loc)
-        self.assertEqual((await self.api("DELETE", f"/v1/links/{link['id']}"))[0], 204)
+        self.assertEqual((await self.api("DELETE", f"/v2/links/{link['id']}"))[0], 204)
         self.assertTrue(await self.drain_until_cut(resp))
         self.assertEqual(await self.aborted_reason(), "revoked")
         await self.idle()
@@ -201,7 +261,7 @@ class CortesTests(GatewayCase):
 
     async def test_revocar_sin_streams_no_deja_estado_en_memoria(self):
         link = await self.create_link()
-        await self.api("DELETE", f"/v1/links/{link['id']}")
+        await self.api("DELETE", f"/v2/links/{link['id']}")
         self.assertEqual(self.ctx.revoked, set())
 
     async def test_tope_por_enlace_y_otro_enlace_sigue_sirviendo(self):
@@ -258,13 +318,13 @@ class InternaBearerTests(GatewayCase):
     async def test_bearer_con_bytes_no_ascii_da_401_limpio(self):
         for raw in (b"Bearer \xff\xfe", b"Bearer \xc3\x28", b"Bearer " + b"\xed\xa0\x80", "Bearer ñandú".encode()):
             reader, writer = await asyncio.open_connection("127.0.0.1", self.gw.internal_port)
-            writer.write(b"GET /v1/health HTTP/1.1\r\nHost: x\r\nAuthorization: " + raw + b"\r\nConnection: close\r\n\r\n")
+            writer.write(b"GET /v2/health HTTP/1.1\r\nHost: x\r\nAuthorization: " + raw + b"\r\nConnection: close\r\n\r\n")
             await writer.drain()
             data = await reader.read()
             writer.close()
             self.assertTrue(data.startswith(b"HTTP/1.1 401"), (raw, data[:60]))
             self.assertNotIn(b"Traceback", data)
-        status, _ = await self.api("GET", "/v1/health", token=API_TOKEN)
+        status, _ = await self.api("GET", "/v2/health", token=API_TOKEN)
         self.assertEqual(status, 200)
 
 
@@ -272,5 +332,5 @@ class RelpathAnidadoTests(GatewayCase):
     async def test_post_links_rechaza_anidados_con_400(self):
         self.write_dump("srv/sub/x.sql.gz", b"datos")
         for rel in ("srv/sub/x.sql.gz", "a/b/c.sql.gz", "solo.sql.gz"):
-            status, data = await self.api("POST", "/v1/links", {"relpath": rel, "created_by": "t", "job_id": "j"})
+            status, data = await self.api("POST", "/v2/links", {"files": [{"relpath": rel}], "created_by": "t", "job_id": "j"})
             self.assertEqual((status, data["error"]["code"]), (400, "invalid_request"), rel)

@@ -143,7 +143,7 @@ class EstadosTests(GatewayCase):
     async def test_revocado(self):
         link = await self.create_link()
         loc = await self.open_session(link)
-        status, _ = await self.api("DELETE", f"/v1/links/{link['id']}")
+        status, _ = await self.api("DELETE", f"/v2/links/{link['id']}")
         self.assertEqual(status, 204)
         for method, url in [("GET", f"/d/{link['token']}"), ("POST", f"/d/{link['token']}"), ("GET", loc)]:
             async with self.http.request(method, self.pub + url, allow_redirects=False) as resp:
@@ -235,7 +235,7 @@ class CabecerasTests(GatewayCase):
             self.assertEqual(resp.headers["Content-Type"], "text/html; charset=utf-8")
         self.assertIn("&lt;b&gt;&amp;x.sql.gz", page)
         self.assertNotIn("<b>", page)
-        self.assertIn('<form method="post">', page)
+        self.assertIn(f'<form method="post" action="/d/{link["token"]}/0">', page)
         self.assertIn("a" * 64, page)
         for prohibido in ("<script", "http://", "https://", "src="):
             self.assertNotIn(prohibido, page)
@@ -249,7 +249,7 @@ class CabecerasTests(GatewayCase):
             await resp.read()
         loc = await self.open_session(link)
         await self.fetch(loc)
-        await self.api("DELETE", f"/v1/links/{link['id']}")
+        await self.api("DELETE", f"/v2/links/{link['id']}")
         with open(os.path.join(self.data, "audit.jsonl"), encoding="utf-8") as fh:
             text = fh.read()
         self.assertNotIn(link["token"], text)

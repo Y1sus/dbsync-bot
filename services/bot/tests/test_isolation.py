@@ -7,7 +7,7 @@ import sys
 import unittest
 
 import bot.audit, bot.auth, bot.config, bot.durations, bot.flow, bot.gateway_client  # noqa: E401,F401
-import bot.jobs, bot.notify, bot.redact, bot.runner_client  # noqa: E401,F401
+import bot.gitlab_client, bot.jobs, bot.notify, bot.packages, bot.redact, bot.runner_client  # noqa: E401,F401
 
 
 class IsolationTests(unittest.TestCase):

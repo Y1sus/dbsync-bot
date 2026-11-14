@@ -53,7 +53,7 @@ services:
     image: dbsync-bot-bot:local
     depends_on:
       gateway: { condition: service_healthy }
-    mem_limit: 256m
+    mem_limit: 320m
     cpus: 0.5
     pids_limit: 200
     environment:
@@ -68,11 +68,16 @@ services:
       DBSYNC_KNOWN_HOSTS: /run/secrets/known_hosts
       DBSYNC_SSH_KEY: /run/secrets/dbsync_ssh_key
       DBSYNC_MIN_FREE_MB: "${DBSYNC_MIN_FREE_MB:-1024}"
+      GITLAB_BASE_URL: "${GITLAB_BASE_URL:-https://gitlab.com}"
+      GITLAB_TOKEN_FILE: /run/secrets/gitlab_token
+      GITLAB_PROJECTS_FILE: /run/projects.json
+      GITLAB_MAX_ARCHIVE_MB: "${GITLAB_MAX_ARCHIVE_MB:-500}"
     volumes:
       - ./data/dumps:/dumps
       - ./data/bot:/data
       - ${DBSYNC_SERVERS_DIR:-./servers}:/run/servers:ro
-    secrets: [telegram_token, gateway_token, dbsync_ssh_key, known_hosts]
+      - ${DBSYNC_PROJECTS_FILE:-./projects.json}:/run/projects.json:ro
+    secrets: [telegram_token, gateway_token, dbsync_ssh_key, known_hosts, gitlab_token]
 
 secrets:
   telegram_token:
@@ -83,3 +88,5 @@ secrets:
     file: ./secrets/ssh/dbsync_bot_ed25519
   known_hosts:
     file: ./secrets/known_hosts
+  gitlab_token:
+    file: ./secrets/gitlab_token

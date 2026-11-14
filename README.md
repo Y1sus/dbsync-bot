@@ -20,15 +20,17 @@ equipo y no se modifica desde aquí. Los arreglos de uno no se propagan al otro.
 | 2 | `contracts/` | Hecha: `job-result`, `link` y `gateway-api` |
 | 3 | `services/gateway` | Hecha: enlaces, descargas con `Range`, limpieza |
 | 4 | `services/bot` | Hecha: bot de Telegram (aiogram) |
-| 5 | `docker-compose.yml` y despliegue | Hecha en local; falta desplegar en el VPS (ver `deploy/README.md`) |
+| 5 | `docker-compose.yml` y despliegue | Hecho y en producción (dumps); falta desplegar `/codigo` (ver `deploy/README.md`) |
+| 6 | Código de GitLab y enlaces multi-archivo | Hecha en local; pendiente token `read_api`, catálogo y despliegue |
 
 ## Estructura
 
 ```
 contracts/                esquemas y contrato HTTP que comparten los servicios
 services/runner/          dump no interactivo (bash): runner.sh, lib/, tests/, evals/
-services/gateway/         enlaces temporales y descargas (Python + aiohttp)
-services/bot/             bot de Telegram (Python + aiogram), invoca el runner
+services/gateway/         enlaces temporales multi-archivo y descargas (Python + aiohttp)
+services/gitlab/          descarga de código de GitLab por rama o tag (solo lectura, Python stdlib)
+services/bot/             bot de Telegram (Python + aiogram): /dump, /codigo, /links, /revoke
 integration/              eval runner -> bot -> gateway real
 docker-compose.yml        gateway + bot (usuario no root, solo lectura, límites de recursos)
 deploy/                   runbook y vhost nginx de dumps.synkra.app

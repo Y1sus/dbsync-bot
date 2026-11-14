@@ -6,7 +6,7 @@
 import os
 import stat
 
-SUFFIX = ".sql.gz"
+SUFFIXES = {".sql.gz": "db", ".zip": "code", ".tar.gz": "code"}
 
 
 class PathError(Exception):
@@ -14,6 +14,27 @@ class PathError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+def kind_of(name):
+    """Tipo derivado del sufijo (db o code); None si el sufijo no está permitido."""
+    for suffix, kind in SUFFIXES.items():
+        if name.endswith(suffix):
+            return kind
+    return None
+
+
+def is_final_name(name):
+    return not name.startswith(".") and kind_of(name) is not None
+
+
+def available(root, relpath):
+    """True si el dump existe en disco como archivo regular sin enlaces simbólicos."""
+    try:
+        resolve_dump(root, relpath)
+    except PathError:
+        return False
+    return True
 
 
 def validate_relpath(relpath):
@@ -27,10 +48,10 @@ def validate_relpath(relpath):
     for part in parts:
         if part in ("", ".", "..") or part.startswith("."):
             raise PathError("invalid_request", "relpath contiene componentes no permitidos")
-    if not relpath.endswith(SUFFIX):
-        raise PathError("invalid_request", "relpath debe terminar en .sql.gz")
+    if kind_of(relpath) is None:
+        raise PathError("invalid_request", "relpath debe terminar en .sql.gz, .zip o .tar.gz")
     if len(parts) != 2:
-        raise PathError("invalid_request", "relpath debe tener la forma <servidor>/<archivo>.sql.gz")
+        raise PathError("invalid_request", "relpath debe tener la forma <fuente>/<archivo>")
     return parts
 
 

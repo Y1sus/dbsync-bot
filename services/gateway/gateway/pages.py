@@ -52,6 +52,17 @@ CSS = (
     ".btn .ico{width:1.35rem;height:1.35rem}"
     ".btn:hover{background:var(--accent-h)}"
     ".btn:focus-visible{outline:3px solid var(--ring);outline-offset:3px}"
+    ".files{margin:1.25rem 0 0;padding:0;list-style:none;display:grid;gap:.9rem}"
+    ".file{border:1px solid var(--line);border-radius:1rem;padding:1rem}"
+    ".file-head{display:flex;align-items:center;gap:.75rem;margin-bottom:.75rem}"
+    ".kind{display:flex;align-items:center;justify-content:center;flex:none;width:2.5rem;height:2.5rem;"
+    "border-radius:.7rem}"
+    ".kind .ico{width:1.4rem;height:1.4rem}"
+    ".kindname{font-size:.8125rem;font-weight:650;letter-spacing:.04em;text-transform:uppercase;"
+    "color:var(--muted)}"
+    ".file-name{min-width:0;overflow-wrap:anywhere}"
+    ".file .meta{margin:0 0 1rem}"
+    ".when{margin:1.25rem 0 0;color:var(--muted)}"
     ".foot{margin:1rem .5rem 0;text-align:center;font-size:.875rem;color:var(--muted)}"
     "@media (min-width:34rem){.card{padding:2rem}h1{font-size:1.75rem}}"
     "@media (forced-colors:active){.btn{border:2px solid ButtonText}}"
@@ -64,6 +75,7 @@ CSP = (
 )
 
 DESCRIPTION = "Enlace de descarga temporal y privado."
+LANDING_DESCRIPTION = "Tus archivos están listos."
 
 _ICONS = {
     "download": '<path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 20h16"/>',
@@ -73,6 +85,9 @@ _ICONS = {
     "alert": '<path d="M12 3l10 18H2z"/><path d="M12 10v4"/><path d="M12 17.5v.01"/>',
     "filex": '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/><path d="M9.5 12.5l5 5"/><path d="M14.5 12.5l-5 5"/>',
     "search": '<circle cx="11" cy="11" r="6"/><path d="M20 20l-4.2-4.2"/>',
+    "code": '<path d="M8 8l-4 4 4 4"/><path d="M16 8l4 4-4 4"/><path d="M13.5 5l-3 14"/>',
+    "database": '<ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/>'
+                '<path d="M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/>',
     "lock": '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 018 0v3"/>',
 }
 
@@ -84,6 +99,9 @@ _STATIC = {
     "exhausted": (410, "Enlace agotado", "info", "Agotado", "check", "Este enlace ya se usó",
                   "Alcanzó su límite de descargas y ya no está disponible.",
                   "Si necesitas el archivo otra vez, pide un enlace nuevo."),
+    "filedone": (410, "Archivo agotado", "info", "Agotado", "check", "Este archivo ya se descargó",
+                 "Alcanzó su límite de descargas. Los demás archivos del enlace siguen disponibles.",
+                 "Vuelve a la página del enlace para descargar el resto."),
     "revoked": (410, "Enlace revocado", "err", "Revocado", "ban", "Este enlace fue revocado",
                 "Quien lo compartió lo desactivó, así que ya no se puede descargar.",
                 "Si lo necesitas, pide un enlace nuevo."),
@@ -105,6 +123,10 @@ _STATIC = {
     "busy": (503, "Servidor ocupado", "warn", "Servidor ocupado", "clock", "Estamos ocupados",
              "Hay muchas descargas en curso en este momento.",
              "Espera unos segundos y vuelve a intentarlo."),
+    "budget": (410, "Límite de la sesión", "warn", "Límite alcanzado", "ban",
+               "Esta descarga ya envió todo lo permitido",
+               "Esta sesión alcanzó el máximo de datos que puede entregar de este archivo.",
+               "Si no pudiste guardarlo, pide un enlace nuevo a quien te lo compartió."),
     "forbidden": (403, "Solicitud no permitida", "err", "Rechazada", "lock", "No pudimos verificar la solicitud",
                   "Por seguridad solo aceptamos descargas iniciadas desde la propia página del enlace.",
                   "Abre el enlace directamente en tu navegador y usa el botón Descargar."),
@@ -121,13 +143,13 @@ def _icon(name):
     return f'<svg class="ico" viewBox="0 0 24 24" aria-hidden="true" focusable="false">{_ICONS[name]}</svg>'
 
 
-def _doc(title, inner):
+def _doc(title, inner, description=DESCRIPTION):
     return (
         '<!doctype html><html lang="es"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
         '<meta name="robots" content="noindex">'
         '<meta name="color-scheme" content="light dark">'
-        f'<meta name="description" content="{html.escape(DESCRIPTION)}">'
+        f'<meta name="description" content="{html.escape(description)}">'
         f"<title>{html.escape(title)}</title><style>{CSS}</style></head>"
         f'<body><main class="wrap">{inner}'
         '<p class="foot">Enlace temporal y privado. No compartas esta dirección.</p></main></body></html>'
@@ -163,26 +185,57 @@ def remaining_text(seconds):
     return f"{days} d {hours} h" if hours else f"{days} d"
 
 
-def landing(filename, size_bytes, sha256, expires_text, remaining, downloads_left):
+KINDS = {"db": ("database", "Base de datos", "info"), "code": ("code", "Código", "ok")}
+
+
+def _file_item(token, item, available):
     esc = html.escape
+    icon, kind_label, tone = KINDS.get(item["kind"], KINDS["code"])
+    left = item["downloads_left"]
+    if left <= 0:
+        state = ("info", "check", "Agotado")
+    elif not available:
+        state = ("warn", "filex", "No disponible")
+    else:
+        state = None
+    sha = f'<code class="mono">{esc(item["sha256"])}</code>' if item["sha256"] else "No disponible"
     rows = [
-        ("Archivo", f'<code class="mono">{esc(filename)}</code>'),
-        ("Tamaño", esc(human_size(size_bytes))),
-        ("SHA-256", f'<code class="mono">{esc(sha256)}</code>' if sha256 else "No disponible"),
-        ("Expira", f'{esc(expires_text)}<span class="rest">expira en {esc(remaining_text(remaining))}</span>'),
-        ("Descargas restantes", esc(str(downloads_left))),
+        ("Tamaño", esc(human_size(item["size_bytes"]))),
+        ("SHA-256", sha),
+        ("Descargas restantes", esc(str(max(left, 0)))),
     ]
     meta = "".join(f"<div><dt>{esc(k)}</dt><dd>{v}</dd></div>" for k, v in rows)
+    if state:
+        action = f'<span class="badge t-{state[0]}">{_icon(state[1])}{state[2]}</span>'
+    else:
+        action = (
+            f'<form method="post" action="/d/{esc(token)}/{int(item["index"])}">'
+            f'<button class="btn" type="submit" aria-label="Descargar {esc(item["filename"])}">'
+            f"{_icon('download')}Descargar</button></form>"
+        )
+    return (
+        '<li class="file"><div class="file-head">'
+        f'<div class="kind t-{tone}">{_icon(icon)}</div>'
+        f'<div class="file-name"><div class="kindname">{esc(kind_label)}</div>'
+        f'<code class="mono">{esc(item["filename"])}</code></div></div>'
+        f'<dl class="meta">{meta}</dl>{action}</li>'
+    )
+
+
+def landing(token, items, expires_text, remaining):
+    """Página de descarga. `items`: dicts con index, filename, kind, size_bytes, sha256, downloads_left, available."""
+    esc = html.escape
+    heading = "Tu archivo está listo" if len(items) == 1 else "Tus archivos están listos"
+    lis = "".join(_file_item(token, item, item["available"]) for item in items)
     inner = (
         '<section class="card">'
         f'{_head("ok", "download", "Disponible")}'
-        "<h1>Tu respaldo está listo</h1>"
-        '<p class="lead">Descárgalo antes de que expire. Si se interrumpe, puedes volver a pulsar el botón.</p>'
-        f'<dl class="meta">{meta}</dl>'
-        '<form method="post"><button class="btn" type="submit">'
-        f"{_icon('download')}Descargar archivo</button></form></section>"
+        f"<h1>{heading}</h1>"
+        '<p class="lead">Descárgalos antes de que expiren. Si una descarga se interrumpe, puedes volver a pulsar su botón.</p>'
+        f'<p class="when">Expira {esc(expires_text)}<span class="rest">expira en {esc(remaining_text(remaining))}</span></p>'
+        f'<ul class="files">{lis}</ul></section>'
     )
-    return 200, _doc("Descarga de respaldo", inner)
+    return 200, _doc("Descarga lista", inner, LANDING_DESCRIPTION)
 
 
 def render(kind, retry_after=None):

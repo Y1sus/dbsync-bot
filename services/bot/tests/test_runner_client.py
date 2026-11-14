@@ -57,6 +57,36 @@ class RunnerClientTests(unittest.IsolatedAsyncioTestCase):
         env = {"FAKE_MODE": mode, "FAKE_ARGS_FILE": self.args_file, "FAKE_PID_FILE": self.pid_file, **extra}
         return RunnerClient(FAKE, timeout=timeout, env=env, kill_grace=0.3)
 
+    async def assert_flood_rejected(self, mode, stream, kib):
+        with self.assertRaises(RunnerError) as cm:
+            await self.client(mode, timeout=10).dump("a", "b", "c", GOOD_ID)
+        self.assertEqual(cm.exception.code, "E_BAD_OUTPUT")
+        msg = cm.exception.message
+        self.assertIn(stream, msg)
+        self.assertIn(f"{kib} KiB", msg)
+        self.assertNotIn("xxxx", msg)
+        self.assertLess(len(msg), 200)
+        pid = int(read_pid(self.pid_file))
+        for _ in range(50):
+            if not pid_alive(pid):
+                break
+            await asyncio.sleep(0.01)
+        self.assertFalse(pid_alive(pid), "quedó un proceso huérfano")
+
+    async def test_stdout_over_cap_kills_group_and_reports_size_only(self):
+        await self.assert_flood_rejected("flood_out", "stdout", 1024)
+
+    async def test_stderr_over_cap_kills_group_and_reports_size_only(self):
+        await self.assert_flood_rejected("flood_err", "stderr", 256)
+
+    async def test_slow_output_within_cap_still_works(self):
+        res = await self.client("trickle").dump("a", "b", "c", GOOD_ID)
+        self.assertEqual(res["filename"], "f.sql.gz")
+
+    def test_caps_are_one_mib_and_256_kib(self):
+        from bot import runner_client
+        self.assertEqual((runner_client.STDOUT_MAX, runner_client.STDERR_MAX), (1024 * 1024, 256 * 1024))
+
     def recorded(self):
         with open(self.args_file) as fh:
             return fh.read().splitlines()
@@ -115,7 +145,7 @@ class RunnerClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_timeout_kills_whole_process_group(self):
         t0 = time.monotonic()
         with self.assertRaises(RunnerError) as cm:
-            await self.client("hang", timeout=0.15).dump("a", "b", "c", GOOD_ID)
+            await self.client("hang", timeout=0.06).dump("a", "b", "c", GOOD_ID)
         self.assertEqual(cm.exception.code, "E_TIMEOUT")
         self.assertLess(time.monotonic() - t0, 3)
         child = await wait_pid(self.pid_file)

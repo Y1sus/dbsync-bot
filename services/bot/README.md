@@ -16,6 +16,7 @@ y responde con la URL. Solo atiende a los ids de `BOT_ALLOWED_USER_IDS`.
 | `/servers` | servidores configurados |
 | `/dump` | asistente con botones: servidor, contenedor, base, confirmación (TTL 1/4/24 h, descargas 1/3/5) |
 | `/dump <servidor> <contenedor> <db> [ttl=2h] [max=3]` | forma directa (`ttl` de 60s a 7d, `max` de 1 a 20) |
+| `/codigo` | asistente: proyecto del catálogo, rama o tag (paginado, 🏷 Tags, 🔎 Buscar), formato (zip o tar.gz), qué entregar (Código, Base de datos o Ambos), vigencia y descargas por archivo, confirmación |
 | `/links` | enlaces activos, con botón para revocar; revocar o vencer elimina el dump |
 | `/revoke <id>` | revoca el enlace y el gateway borra el dump (`DELETE /v1/links/{id}` sin `keep_file`) |
 | `/status` | job en curso o libre |
@@ -37,7 +38,8 @@ Telegram admite 64 bytes) y expira a los 10 minutos sin uso. Los botones llevan
 | `BOT_DEFAULT_TTL_SECONDS` | `3600` | TTL por defecto (60 a 604800) |
 | `BOT_DEFAULT_MAX_DOWNLOADS` | `1` | descargas por defecto (1 a 20) |
 | `BOT_JOB_TIMEOUT_SECONDS` | `1800` | límite de cada llamada al runner |
-| `BOT_MAX_JOBS` | `1` | dumps simultáneos; el resto espera en cola con aviso |
+| `BOT_MAX_JOBS` | `1` | jobs simultáneos (un dump o un paquete ocupa un cupo); el resto espera en cola con aviso |
+| `BOT_GITLAB_FETCH` | `/app/gitlab/fetch.py` | CLI del servicio de GitLab (se ejecuta con el intérprete del bot). Hereda `GITLAB_*` y `DBSYNC_*` |
 | `BOT_TELEGRAM_API_BASE` | (vacío) | solo pruebas: apunta a un servidor Telegram falso |
 
 El runner hereda el entorno del bot (`DBSYNC_SERVERS_DIR`, `DBSYNC_DUMPS_DIR`,
@@ -74,10 +76,29 @@ mensaje claro, sin traceback.
 - Revocar (botón o `/revoke`) no pasa `keep_file`: el gateway borra el dump. El texto dice
   "Enlace revocado; el dump se eliminará" porque una sesión abierta o una descarga en curso
   pueden retrasar el borrado unos minutos.
+- Enlaces v2 (`/v2/links`): un enlace lleva de 1 a 4 archivos (`files[]`) y `max_downloads`
+  aplica por archivo. `/dump` crea un enlace de un archivo; `/links` lista cada archivo con
+  su conteo de descargas.
+- `/codigo` (`flow.CodeWizard`, ids `k|<8 hex>|acción|n`, sin aiogram): el catálogo sale de
+  `fetch.py catalog`; ramas y tags traen su `sha`, que se muestra como `proyecto@ref (sha8)`.
+  La confirmación de "Base de datos" y "Ambos" muestra el destino exacto
+  `servidor/contenedor/base` del catálogo (un mapeo equivocado entregaría la base de otro
+  cliente). La búsqueda es el siguiente mensaje de texto del usuario autorizado (estado en
+  memoria, vence a los 10 min, se sanitiza a `[A-Za-z0-9._/@+-]` y 60 caracteres, nunca se
+  audita). Solo se ofrecen referencias con esos mismos caracteres porque viajan como
+  argumento del CLI.
+- Paquetes (`packages.py`, `jobs.py`): "Código" = `fetch.py archive`, "BD" = dump del
+  runner, "Ambos" = las dos partes en paralelo (`asyncio.gather`) con UN cupo de
+  `BOT_MAX_JOBS`. Subtareas con `job_id` derivado (`<job>-code`, `<job>-db`). Entrega
+  parcial: si una parte falla el enlace se crea con la otra y el aviso dice cuál falló y
+  por qué; si fallan ambas no hay enlace. Cancelación, timeout y apagado matan el grupo de
+  procesos de cada parte. El aviso final sigue la misma política que `/dump` (mensaje nuevo
+  con push, 3 intentos, URL solo en `<code>`, botón de copiar y de revocar).
 - Seguridad de logs: `redact.py` (filtro en el handler raíz) enmascara el token del bot
-  (`/bot<token>/`), el del gateway y cualquier `Bearer`, también en tracebacks.
+  (`/bot<token>/`), el del gateway, tokens `glpat-...` de GitLab y cualquier `Bearer`, también en tracebacks.
 - Auditoría: `BOT_DATA_DIR/audit.jsonl` (0600) con `command`, `job_start`, `job_end`,
-  `link_created`, `link_failed`, `link_revoked`, `update_rejected`. Sin URLs ni tokens.
+  `link_created`, `link_failed`, `link_revoked`, `update_rejected`. Sin URLs ni tokens
+  ni texto de búsquedas.
 - Todos los mensajes salen con `parse_mode=HTML`, `html.escape` y vista previa
   deshabilitada (`link_preview_options.is_disabled=true`).
 
@@ -86,7 +107,7 @@ mensaje claro, sin traceback.
 ```bash
 cd services/bot
 PY=../../.venv/bin/python
-$PY -m unittest discover -s tests -t .     # puerta: offline, sin aiogram, ~1.5 s
+$PY -m unittest discover -s tests -t .     # puerta: offline, sin aiogram, ~1.5 s (187 pruebas)
 $PY evals/e2e_bot.py                        # eval e2e: bot real vs Telegram, gateway y runner falsos
 ```
 
@@ -95,7 +116,7 @@ El eval arranca `python -m bot` como subproceso con `BOT_TELEGRAM_API_BASE` haci
 
 ## Docker
 
-Contexto de build en la raíz del repo (copia `services/runner/` y `services/bot/`):
+Contexto de build en la raíz del repo (copia `services/runner/`, `services/gitlab/` y `services/bot/`; sigue sin necesitar `git`):
 
 ```bash
 docker build -f services/bot/Dockerfile -t dbsync-bot .

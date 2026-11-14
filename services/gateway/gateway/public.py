@@ -1,5 +1,5 @@
 # =============================================================================
-# services/gateway/gateway/public.py — Listener público: páginas, sesiones, descarga y endurecimiento
+# services/gateway/gateway/public.py — Listener público: páginas, sesiones por archivo, descarga y endurecimiento
 # Autor: Jesús Montalvo <jmontalvo_m@outlook.com>
 # =============================================================================
 
@@ -101,9 +101,19 @@ async def _lookup(ctx, token):
     return link
 
 
+def _file_index(request, link):
+    """Índice del archivo pedido; la ruta sin índice solo existe para enlaces de un archivo. None si no existe."""
+    raw = request.match_info.get("n")
+    if raw is None:
+        return 0 if len(link["files"]) == 1 else None
+    index = int(raw)
+    return index if index < len(link["files"]) else None
+
+
 async def landing(request):
     ctx = request.app[CTX]
-    link = await _lookup(ctx, request.match_info["token"])
+    token = request.match_info["token"]
+    link = await _lookup(ctx, token)
     if link is None:
         return _not_found()
     if link["state"] != "active":
@@ -113,11 +123,17 @@ async def landing(request):
     ip, ua = client_info(request)
     ctx.audit.log("landing_view", link["id"], ip, ua)
     now = ctx.now()
-    status, doc = pages.landing(
-        link["filename"], link["size_bytes"], link["sha256"],
-        _expires_text(link["expires_at"]),
-        link["expires_at"] - now, link["max_downloads"] - link["downloads_completed"],
-    )
+    root = ctx.config.dumps_root
+    availability = await ctx.db(lambda: [paths.available(root, item["relpath"]) for item in link["files"]])
+    items = [
+        {
+            "index": item["idx"], "filename": item["filename"], "kind": item["kind"],
+            "size_bytes": item["size_bytes"], "sha256": item["sha256"],
+            "downloads_left": link["max_downloads"] - item["downloads_completed"], "available": ok,
+        }
+        for item, ok in zip(link["files"], availability)
+    ]
+    status, doc = pages.landing(token, items, _expires_text(link["expires_at"]), link["expires_at"] - now)
     return web.Response(status=status, text=doc, content_type="text/html", charset="utf-8")
 
 
@@ -132,21 +148,28 @@ async def start_session(request):
     link = await _lookup(ctx, token)
     if link is None:
         return _not_found()
+    index = _file_index(request, link)
+    if index is None:
+        return _not_found()
     status, session_id = await ctx.db(
-        ctx.store.open_or_reuse_session, link["id"], ctx.now(), ctx.config.session_ttl,
+        ctx.store.open_or_reuse_session, link["id"], index, ctx.now(), ctx.config.session_ttl,
         ctx.config.post_download_grace
     )
     if status == "not_found":
         return _not_found()
+    if status == "exhausted" and len(link["files"]) > 1:
+        return _gone("filedone")
     if status != "ok":
         return _gone(status)
-    return web.Response(status=303, headers={"Location": f"/d/{token}/f/{session_id}"})
+    legacy = request.match_info.get("n") is None
+    where = f"/d/{token}/f/{session_id}" if legacy else f"/d/{token}/{index}/f/{session_id}"
+    return web.Response(status=303, headers={"Location": where})
 
 
-def _claim(ctx, link, session_id, stream):
+def _claim(ctx, link, idx, session_id, stream):
     """Valida la sesión y reserva el stream bajo el candado de borrado (cierra la carrera con la limpieza)."""
     with ctx.store.locked():
-        session = ctx.store.get_session(session_id, link["id"])
+        session = ctx.store.get_session(session_id, link["id"], idx)
         if session is None:
             current = ctx.store.get_link(link["id"], ctx.now())
             return "revoked" if current and current["state"] == "revoked" else "notfound"
@@ -156,7 +179,7 @@ def _claim(ctx, link, session_id, stream):
             cfg = ctx.config
             if ctx.active.total >= cfg.max_streams or ctx.active.count(link["id"]) >= cfg.max_streams_per_link:
                 return "busy"
-            ctx.active.enter(link["id"])
+            ctx.active.enter(link["id"], idx)
     return "ok"
 
 
@@ -166,10 +189,14 @@ async def download(request):
     session_id = request.match_info["session"]
     if link is None:
         return _not_found()
+    idx = _file_index(request, link)
+    if idx is None:
+        return _not_found()
     if link["state"] == "revoked":
         return _gone("revoked")
+    item = link["files"][idx]
     stream = request.method != "HEAD"
-    verdict = await ctx.db(_claim, ctx, link, session_id, stream)
+    verdict = await ctx.db(_claim, ctx, link, idx, session_id, stream)
     if verdict == "notfound":
         return _not_found()
     if verdict in ("session", "revoked"):
@@ -178,7 +205,7 @@ async def download(request):
         return _page("busy", headers={"Retry-After": "30"})
     try:
         try:
-            fd, size = await ctx.db(paths.open_dump, ctx.config.dumps_root, link["relpath"])
+            fd, size = await ctx.db(paths.open_dump, ctx.config.dumps_root, item["relpath"])
         except paths.PathError:
             return _gone("file")
         try:
@@ -190,13 +217,13 @@ async def download(request):
                 start, end = rng if rng else (0, size - 1)
                 reserved = await ctx.db(ctx.store.reserve_bytes, session_id, end - start + 1, size, ctx.now())
                 if reserved != "ok":
-                    return _gone("budget" if reserved == "budget" else "session")
-            return await send(request, ctx, link, session_id, fd, size, rng)
+                    return _gone("session" if reserved == "session" else "budget")
+            return await send(request, ctx, link, item, session_id, fd, size, rng)
         finally:
             os.close(fd)
     finally:
         if stream:
-            ctx.active.exit(link["id"])
+            ctx.active.exit(link["id"], idx)
             if not ctx.active.busy(link["id"]):
                 ctx.revoked.discard(link["id"])
 
@@ -239,10 +266,13 @@ def create_app(ctx):
     app[CTX] = ctx
     app.on_response_prepare.append(_add_headers)
     tok = r"{token:[A-Za-z0-9_-]{43}}"
+    idx = r"{n:[0-3]}"
+    sess = r"{session:[0-9a-f]{32}}"
     app.router.add_route("GET", f"/d/{tok}", landing)
     app.router.add_route("HEAD", f"/d/{tok}", landing)
     app.router.add_route("POST", f"/d/{tok}", start_session)
-    sess = r"{session:[0-9a-f]{32}}"
-    app.router.add_route("GET", f"/d/{tok}/f/{sess}", download)
-    app.router.add_route("HEAD", f"/d/{tok}/f/{sess}", download)
+    app.router.add_route("POST", f"/d/{tok}/{idx}", start_session)
+    for method in ("GET", "HEAD"):
+        app.router.add_route(method, f"/d/{tok}/f/{sess}", download)
+        app.router.add_route(method, f"/d/{tok}/{idx}/f/{sess}", download)
     return app

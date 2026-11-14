@@ -5,6 +5,7 @@
 # =============================================================================
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -26,6 +27,8 @@ from tests.fakes.gateway import TOKEN as GW_TOKEN, FakeGateway  # noqa: E402
 BOT_TOKEN = "123456:TEST"
 OWNER, STRANGER = 42, 777
 RUNNER = os.path.join(ROOT, "tests", "fakes", "fake_runner.sh")
+FETCH = os.path.join(ROOT, "tests", "fakes", "fake_fetch.py")
+GL_SECRET = "glpat" "-EVALSECRET-999"
 PASS_THRESHOLD = 1.0
 results = []
 
@@ -59,7 +62,7 @@ def strip_code(text):
 
 def new_sends(tg, start):
     """Mensajes nuevos desde `start`, sin contar el de progreso inicial."""
-    return [c["params"] for c in tg.calls[start:] if c["method"] == "sendMessage" and not c["params"].get("text", "").startswith("Generando dump")]
+    return [c["params"] for c in tg.calls[start:] if c["method"] == "sendMessage" and not c["params"].get("text", "").startswith(("Generando dump", "Preparando"))]
 
 
 async def job_command(h, text, start):
@@ -88,7 +91,7 @@ def check_result_message(tg, start, key, label, expect_summary):
     check(f"{label}: primer renglón es el resumen", p["text"].split("\n")[0].startswith(expect_summary), p["text"][:80])
     progress = tg.messages[key]
     check(f"{label}: el progreso se editó a un estado final corto sin URL",
-          "Generando" not in progress["text"] and len(progress["text"]) < 160 and "http" not in progress["text"], progress["text"])
+          not progress["text"].startswith(("Generando", "Preparando")) and len(progress["text"]) < 160 and "http" not in progress["text"], progress["text"])
     return p
 
 
@@ -110,9 +113,14 @@ class Harness:
     def __init__(self, tg, gw, tmp):
         self.tg, self.gw, self.tmp = tg, gw, tmp
         self.mode_file = os.path.join(tmp, "mode")
+        self.fetch_mode_file = os.path.join(tmp, "fetch_mode")
 
     def set_runner_mode(self, mode):
         with open(self.mode_file, "w") as fh:
+            fh.write(mode)
+
+    def set_fetch_mode(self, mode):
+        with open(self.fetch_mode_file, "w") as fh:
             fh.write(mode)
 
     def latest(self, chat_id=OWNER):
@@ -137,6 +145,170 @@ class Harness:
             return None
         await until(lambda: (self.tg.messages[key]["text"], json.dumps(self.tg.messages[key]["markup"])) != old)
         return self.tg.messages[key]
+
+
+
+async def code_walk(h, project, ref, what, tags=False):
+    """Recorre /codigo por botones hasta la pantalla de confirmación."""
+    m = await h.command("/codigo")
+    m = await h.click(m, find_button(m, lambda b: b["text"] == project))
+    if tags:
+        m = await h.click(m, find_button(m, lambda b: b["text"] == "🏷 Tags"))
+    m = await h.click(m, find_button(m, lambda b: b["text"] == ref))
+    m = await h.click(m, find_button(m, lambda b: b["text"] == "• zip"))
+    return await h.click(m, find_button(m, lambda b: b["text"] == what))
+
+
+async def code_run(h, m, expect_prefix):
+    tg = h.tg
+    start = len(tg.calls)
+    await h.click(m, find_button(m, lambda b: b["text"] == "Generar entrega"), expect_change=False)
+    key = (OWNER, m["message_id"])
+    await until(lambda: any(p.get("text", "").startswith(expect_prefix) for p in new_sends(tg, start)))
+    await until(lambda: tg.messages[key]["text"][:1] in "✅⚠❌")
+    return start, key
+
+
+def sha8(name):
+    return hashlib.sha1(name.encode()).hexdigest()[:8]
+
+
+async def code_scenarios(h):
+    tg, gw = h.tg, h.gw
+    DEST = "alpha/mysql8/appdb"
+
+    print("/codigo: navegación por botones, paginación y búsqueda por texto")
+    m = await h.command("/codigo")
+    check("el catálogo se ofrece como botones", m and find_button(m, lambda b: b["text"] == "alpha-app · BD") and find_button(m, lambda b: b["text"] == "solo-codigo"), m and m["text"])
+    check("HTML hostil del catálogo solo como texto de botón", find_button(m, lambda b: b["text"] == "<b>evil&proj</b> · BD"))
+    m = await h.click(m, find_button(m, lambda b: b["text"] == "alpha-app · BD"))
+    ref_btns = [b for b in buttons(m) if b["callback_data"].split("|")[2] == "r"]
+    check("la rama por defecto va primero y marcada", ref_btns and ref_btns[0]["text"] == "main ★", str([b["text"] for b in ref_btns]))
+    check("ramas paginadas de 8 con ▶ y sin la rama hostil", len(ref_btns) == 8 and find_button(m, lambda b: b["text"] == "▶") and not find_button(m, lambda b: "mala" in b["text"]))
+    check("botones 🏷 Tags y 🔎 Buscar presentes", find_button(m, lambda b: b["text"] == "🏷 Tags") and find_button(m, lambda b: b["text"] == "🔎 Buscar"))
+    m = await h.click(m, find_button(m, lambda b: b["text"] == "▶"))
+    check("la segunda página ofrece ◀", find_button(m, lambda b: b["text"] == "◀") is not None)
+    wiz_key = (OWNER, m["message_id"])
+    m = await h.click(m, find_button(m, lambda b: b["text"] == "🔎 Buscar"))
+    check("buscar pide el texto en el siguiente mensaje", m and "siguiente mensaje" in m["text"], m and m["text"])
+    out_before = h.n_out()
+    await tg.push_text(STRANGER, "feat/b03")
+    await tg.push_text(OWNER, "zzmarker")
+    ok = await until(lambda: "Sin resultados" in tg.messages[wiz_key]["text"])
+    check("el texto del dueño se usa como búsqueda (sin resultados)", ok, tg.messages[wiz_key]["text"])
+    check("el texto de un ajeno se ignora sin ninguna salida", h.n_out() == out_before + 1, f"{h.n_out() - out_before} llamadas")
+    m = tg.messages[wiz_key]
+    m = await h.click(m, find_button(m, lambda b: b["text"] == "🔎 Buscar"))
+    await tg.push_text(OWNER, "  feat/b03 <>&; \n")
+    ok = await until(lambda: find_button(tg.messages[wiz_key], lambda b: b["text"] == "feat/b03") is not None)
+    m = tg.messages[wiz_key]
+    check("la búsqueda sanitizada devuelve la rama", ok and "<script>" not in m["text"], m["text"])
+    m = await h.click(m, find_button(m, lambda b: b["text"] == "feat/b03"))
+    m = await h.click(m, find_button(m, lambda b: b["text"] == "• zip"))
+    m = await h.click(m, find_button(m, lambda b: b["text"] == "📦🗄 Ambos"))
+    check("confirmación: destino exacto de la BD", m and f"<code>{DEST}</code>" in m["text"], m and m["text"])
+    check("confirmación: proyecto@referencia (sha8) del resultado de búsqueda", m and f"<b>alpha-app@feat/b03</b> (<code>{sha8('feat/b03')}</code>)" in m["text"], m and m["text"])
+    m = await h.click(m, find_button(m, lambda b: b["text"] == "4 h"))
+    m = await h.click(m, find_button(m, lambda b: b["text"] == "3"))
+    check("confirmación: vigencia y descargas por archivo", "<b>4 h</b>" in m["text"] and "por archivo: <b>3</b>" in m["text"], m["text"])
+    n_posts = len([r for r in gw.requests if r["method"] == "POST"])
+    start, key = await code_run(h, m, "✅ Listo")
+    p = check_result_message(tg, start, key, "código+BD", "✅ Listo · alpha-app@feat/b03 · código + BD")
+    check_link_message(p, "código+BD")
+    check("lista cada archivo con tipo, nombre y tamaño", "📦 código: <code>alpha-app_feat-b03_" in p["text"] and "🗄 BD: <code>f.sql.gz</code> · 1.2 MB" in p["text"], p["text"])
+    check("descargas permitidas por archivo", "Descargas permitidas: 3 por archivo" in p["text"], p["text"])
+    post = [r for r in gw.requests if r["method"] == "POST"][n_posts:]
+    files = post[0]["body"]["files"] if post else []
+    check("UN enlace v2 con código y luego BD", len(post) == 1 and post[0]["path"] == "/v2/links" and [f["relpath"].split("/")[0] for f in files] == ["_gitlab", "alpha"], str(post))
+    check("max_downloads=3 ttl=14400 label proyecto@rama", post and post[0]["body"]["max_downloads"] == 3 and post[0]["body"]["ttl_seconds"] == 14400 and post[0]["body"]["label"] == "alpha-app@feat/b03", str(post))
+    check("job_id del enlace válido", post and re.fullmatch(r"tg[0-9]+-[0-9a-f]{8}", post[0]["body"]["job_id"]))
+    check("la búsqueda no se envía como mensaje del bot ni queda en el aviso", "zzmarker" not in p["text"])
+    both_link_id = next(l["id"] for l in gw.gw.links.values() if len(l["files"]) == 2)
+
+    print("/codigo: tags y entrega parcial en las dos direcciones")
+    h.set_fetch_mode("err")
+    m = await code_walk(h, "alpha-app · BD", "v1.1.0", "📦🗄 Ambos", tags=True)
+    check("confirmación por tag muestra su sha8", f"alpha-app@v1.1.0</b> (<code>{sha8('v1.1.0')}</code>)" in m["text"], m["text"])
+    start, key = await code_run(h, m, "⚠️ Entrega parcial")
+    p = check_result_message(tg, start, key, "parcial (código falló)", "⚠️ Entrega parcial · alpha-app@v1.1.0 · código falló, BD listo")
+    check("parcial: dice qué falló y por qué (token de GitLab)", "❌ código (E_AUTH): Problema con el token de GitLab" in p["text"], p["text"])
+    check_link_message(p, "parcial (código falló)")
+    check("parcial: el enlace solo lleva la BD", "🗄 BD:" in p["text"] and "📦 código:" not in p["text"])
+    last = [r for r in gw.requests if r["method"] == "POST"][-1]
+    check("parcial: el gateway recibió solo la BD", [f["relpath"].split("/")[0] for f in last["body"]["files"]] == ["alpha"], str(last["body"]))
+    h.set_fetch_mode("ok")
+    h.set_runner_mode("err")
+    m = await code_walk(h, "alpha-app · BD", "main ★", "📦🗄 Ambos")
+    start, key = await code_run(h, m, "⚠️ Entrega parcial")
+    p = check_result_message(tg, start, key, "parcial (BD falló)", "⚠️ Entrega parcial · alpha-app@main · código listo, BD falló")
+    check("parcial: BD falló por SSH", "❌ BD (E_SSH): No se pudo conectar por SSH al servidor." in p["text"] and "📦 código:" in p["text"], p["text"])
+    check_link_message(p, "parcial (BD falló)")
+    print("/codigo: la rama avanza entre la confirmación y la descarga")
+    h.set_fetch_mode("moved")
+    h.set_runner_mode("ok")
+    m = await code_walk(h, "alpha-app · BD", "main ★", "📦🗄 Ambos")
+    start, key = await code_run(h, m, "✅ Listo")
+    p = new_sends(tg, start)[-1]
+    real8 = hashlib.sha1(b"main+1").hexdigest()[:8]
+    check("rama avanzada: el resumen usa el commit real", p["text"].split("\n")[0] == f"✅ Listo · alpha-app@main ({real8}) · código + BD", p["text"])
+    check("rama avanzada: renglón de aviso con ambos commits", f"⚠️ La rama avanzó mientras se preparaba: se entregó {real8} (el que viste era {sha8('main')})" in p["text"], p["text"])
+    check_link_message(p, "rama avanzada")
+    h.set_fetch_mode("ok")
+    print("/codigo: fallo total y enlace fallido")
+    h.set_fetch_mode("err")
+    h.set_runner_mode("err")
+    n_posts = len([r for r in gw.requests if r["method"] == "POST"])
+    m = await code_walk(h, "alpha-app · BD", "main ★", "📦🗄 Ambos")
+    start, key = await code_run(h, m, "❌ Entrega falló")
+    p = new_sends(tg, start)[-1]
+    check("fallo total: solo aviso de error, sin enlace ni botones", "http" not in p["text"] and not p.get("reply_markup") and "E_AUTH" in p["text"] and "E_SSH" in p["text"], p["text"])
+    check("fallo total: no se creó ningún enlace", len([r for r in gw.requests if r["method"] == "POST"]) == n_posts)
+    check("fallo total: el aviso nuevo tiene push y el progreso quedó corto", notify_ok(p) and len(tg.messages[key]["text"]) < 160, tg.messages[key]["text"])
+    h.set_fetch_mode("ok")
+    h.set_runner_mode("ok")
+    gw.gw.mode = "error500"
+    m = await code_walk(h, "alpha-app · BD", "main ★", "📦 Código")
+    start, key = await code_run(h, m, "⚠️ Archivos listos")
+    p = new_sends(tg, start)[-1]
+    check("enlace fallido con archivos existentes lo dice", "pro" not in p["text"] and "📦 código:" in p["text"] and "enlace falló" in p["text"] and "http" not in p["text"], p["text"])
+    gw.gw.mode = "ok"
+
+    print("/codigo: solo código en un proyecto sin BD")
+    m = await h.command("/codigo")
+    m = await h.click(m, find_button(m, lambda b: b["text"] == "solo-codigo"))
+    m = await h.click(m, find_button(m, lambda b: b["text"] == "main ★"))
+    m = await h.click(m, find_button(m, lambda b: b["text"] == "• zip"))
+    check("sin BD solo se ofrece Código", [b["text"] for b in buttons(m)][:1] == ["📦 Código"] and not find_button(m, lambda b: "Base de datos" in b["text"]), str([b["text"] for b in buttons(m)]))
+    m = await h.click(m, find_button(m, lambda b: b["text"] == "📦 Código"))
+    start, key = await code_run(h, m, "✅ Listo")
+    p = check_result_message(tg, start, key, "solo código", "✅ Listo · solo-codigo@main · código")
+    check_link_message(p, "solo código")
+
+    print("/links con archivos y revocar un enlace multi-archivo")
+    m = await h.command("/links")
+    check("/links lista cada archivo con su conteo de descargas", m and "📦" in m["text"] and "🗄" in m["text"] and re.search(r"descargas 0/3", m["text"]), m and m["text"])
+    n_del = len([r for r in gw.requests if r["method"] == "DELETE"])
+    await h.command(f"/revoke {both_link_id}")
+    dels = [r for r in gw.requests if r["method"] == "DELETE"][n_del:]
+    check("revocar el enlace de dos archivos hace DELETE /v2 sin keep_file", dels and dels[0]["path"] == f"/v2/links/{both_link_id}" and "keep_file" not in dels[0]["query"], str(dels))
+    check("el gateway marcó ambos archivos para borrar", {r.split("/")[0] for r in gw.gw.deleted_files} >= {"_gitlab", "alpha"})
+
+    print("/codigo: errores de consulta y secretos")
+    h.set_fetch_mode("err_all")
+    m = await h.command("/codigo")
+    check("catálogo con error de token muestra mensaje claro", m and "E_AUTH" in m["text"] and "token de GitLab" in m["text"], m and m["text"])
+    h.set_fetch_mode("garbage")
+    m = await h.command("/codigo")
+    check("salida inválida de fetch.py da error genérico", m and "E_BAD_OUTPUT" in m["text"] and "Traceback" not in m["text"], m and m["text"])
+    h.set_fetch_mode("ok")
+    everything = json.dumps(tg.calls)
+    check("ningún mensaje ni llamada contiene glpat", "glpat" not in everything)
+    m = await h.command("/codigo")
+    stale = find_button(m, lambda b: b["text"] == "alpha-app · BD")
+    await h.click(m, stale)
+    await tg.push_callback(OWNER, "k|00000000|p|0", OWNER, m["message_id"])
+    ok = await until(lambda: any("sesión expiró" in c["params"].get("text", "") for c in tg.calls_of("editMessageText")[-3:]))
+    check("callback de /codigo expirado se contesta sin romper", ok)
 
 
 async def scenarios(h):
@@ -202,7 +374,7 @@ async def scenarios(h):
     p = check_result_message(tg, start, key, "directo", "✅ Dump listo · a/c · 1.2 MB")
     check_link_message(p, "directo")
     posts = [r for r in gw.requests if r["method"] == "POST"][n_posts:]
-    check("ttl=2h max=3 llegan al gateway", posts and posts[0]["body"]["ttl_seconds"] == 7200 and posts[0]["body"]["max_downloads"] == 3 and posts[0]["body"]["relpath"] == "a/f.sql.gz", str(posts))
+    check("ttl=2h max=3 llegan al gateway", posts and posts[0]["body"]["ttl_seconds"] == 7200 and posts[0]["body"]["max_downloads"] == 3 and posts[0]["body"]["files"][0]["relpath"] == "a/f.sql.gz", str(posts))
     m = await h.command("/dump a b c ttl=5s")
     check("duración inválida da error de uso sin ejecutar", m and "60s y 7d" in m["text"])
 
@@ -233,7 +405,7 @@ async def scenarios(h):
     check("gateway marcó el enlace como revocado", gw.gw.links[link_id]["state"] == "revoked")
     dels = [r for r in gw.requests if r["method"] == "DELETE" and r["path"].endswith(link_id)]
     check("DELETE sin keep_file (el gateway borra el dump)", dels and all("keep_file" not in r["query"] for r in dels), str(dels))
-    check("el dump quedó marcado para borrarse", gw.gw.links[link_id]["relpath"] in gw.gw.deleted_files)
+    check("el dump quedó marcado para borrarse", gw.gw.links[link_id]["files"][0]["relpath"] in gw.gw.deleted_files)
     other = revoke_btns[1]["callback_data"].split("|")[1]
     m3 = await h.command(f"/revoke {other}")
     check("/revoke <id> revoca y avisa que el dump se eliminará", m3 and "revocado; el dump se eliminará" in m3["text"] and gw.gw.links[other]["state"] == "revoked", m3 and m3["text"])
@@ -270,6 +442,8 @@ async def scenarios(h):
     gw.gw.mode = "ok"
     m = await h.command("/links")
     check("el bot sigue vivo tras los errores", m is not None)
+
+    await code_scenarios(h)
 
     print("Callback manipulado")
     m = await h.command("/dump")
@@ -388,12 +562,15 @@ async def main():
     gwh.gw, gwh.requests = gw, gw.requests
     h = Harness(tg, gwh, tmp)
     h.set_runner_mode("ok")
+    h.set_fetch_mode("ok")
     env = {
         **os.environ,
         "BOT_TOKEN_FILE": os.path.join(tmp, "bot_token"), "BOT_ALLOWED_USER_IDS": str(OWNER), "BOT_RUNNER_PATH": RUNNER,
         "BOT_GATEWAY_URL": gw_url, "BOT_GATEWAY_TOKEN_FILE": os.path.join(tmp, "gw_token"), "BOT_DATA_DIR": data_dir,
         "BOT_TELEGRAM_API_BASE": api_base, "BOT_JOB_TIMEOUT_SECONDS": "30", "FAKE_MODE_FILE": h.mode_file,
         "FAKE_PID_FILE": os.path.join(tmp, "child.pid"),
+        "BOT_GITLAB_FETCH": FETCH, "FAKE_FETCH_MODE_FILE": h.fetch_mode_file, "FAKE_FETCH_ERR": "E_AUTH",
+        "FAKE_FETCH_MESSAGE": f"token {GL_SECRET} rechazado",
     }
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "bot", cwd=ROOT, env=env,
@@ -426,6 +603,7 @@ async def main():
         out = "".join(log_lines)
         check("el token del bot no aparece en la salida del bot", BOT_TOKEN not in out and "TEST" not in out)
         check("el token del gateway no aparece en la salida del bot", GW_TOKEN not in out)
+        check("ningún glpat en la salida del bot", "glpat" not in out and GL_SECRET not in out)
         check("sin Traceback en la salida del bot", "Traceback" not in out, out[-600:])
         check("el log dice el username del bot", "@fake_bot" in out)
         audit_path = os.path.join(data_dir, "audit.jsonl")
@@ -433,7 +611,8 @@ async def main():
         events = [json.loads(l) for l in audit.splitlines()]
         kinds = {e["event"] for e in events}
         check("auditoría con comandos, jobs, enlaces y rechazos", {"command", "job_start", "job_end", "link_created", "link_revoked", "update_rejected"} <= kinds, str(kinds))
-        check("auditoría sin tokens ni URLs de descarga", BOT_TOKEN not in audit and GW_TOKEN not in audit and "dumps.test" not in audit)
+        check("auditoría sin tokens ni URLs de descarga", BOT_TOKEN not in audit and GW_TOKEN not in audit and "dumps.test" not in audit and "glpat" not in audit)
+        check("la búsqueda no se audita como texto", "zzmarker" not in audit and "<>" not in audit)
         rejected = [e for e in events if e["event"] == "update_rejected"]
         check("rechazos sin contenido del mensaje", rejected and all(set(e) <= {"ts", "event", "user_id", "kind", "reason"} for e in rejected))
         await gw_server.close()

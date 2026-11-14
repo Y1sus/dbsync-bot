@@ -7,7 +7,7 @@ import contextlib
 import logging
 from dataclasses import dataclass
 
-from aiogram import BaseMiddleware, Bot, Router
+from aiogram import BaseMiddleware, Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
@@ -25,7 +25,7 @@ from .runner_client import RunnerError
 log = logging.getLogger("bot.handlers")
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 COMMANDS = [
-    ("dump", "Generar un dump"), ("servers", "Servidores"), ("links", "Enlaces activos"),
+    ("dump", "Generar un dump"), ("codigo", "Código de GitLab, BD o ambos"), ("servers", "Servidores"), ("links", "Enlaces activos"),
     ("revoke", "Revocar un enlace"), ("status", "Estado de los jobs"), ("help", "Ayuda"),
 ]
 
@@ -38,6 +38,8 @@ class App:
     jobs: object
     store: object
     audit: object
+    gitlab: object = None
+    codes: object = None
 
 
 def markup(rows):
@@ -149,6 +151,34 @@ def build_router(app: App) -> Router:
         flow.set_servers(w, [s["name"] for s in servers])
         await send(message, flow.render(w))
 
+    @router.message(Command("codigo"))
+    async def cmd_codigo(message: Message):
+        try:
+            projects = await app.gitlab.catalog()
+        except RunnerError as exc:
+            return await send(message, flow.View(flow.fmt_gitlab_failure(exc)))
+        w = app.codes.create(message.from_user.id, cfg.default_ttl, cfg.default_max_downloads)
+        flow.set_catalog(w, projects)
+        await send(message, flow.render_code(w))
+
+    @router.message(F.text & ~F.text.startswith("/"))
+    async def on_text(message: Message, bot: Bot):
+        w = app.codes.find_search(message.from_user.id)
+        if w is None or w.chat_id != message.chat.id:
+            return
+        step = flow.apply_search(w, message.text)
+        if step.kind == "invalid":
+            return await send(message, flow.View(step.notice)) if step.notice else None
+        try:
+            flow.set_results(w, await app.gitlab.branches(w.project["name"], w.query))
+        except RunnerError as exc:
+            flow.release(w)
+            w.step = "ref"
+            view = flow.render_code_error(w, flow.fmt_gitlab_failure(exc))
+        else:
+            view = flow.render_code(w)
+        await edit(bot, w.chat_id, w.message_id, view.text, view.keyboard)
+
     @router.message(Command("links"))
     async def cmd_links(message: Message):
         try:
@@ -184,6 +214,8 @@ def build_router(app: App) -> Router:
         chat_id, message_id = msg.chat.id, msg.message_id
         if parsed[0] == "r":
             return await on_revoke(cb, bot, chat_id, message_id, parsed[1])
+        if parsed[0] == "k":
+            return await on_code(cb, bot, chat_id, message_id, parsed[1:], event_update)
         _, wid, action, arg = parsed
         w = app.store.get(wid, cb.from_user.id)
         if w is None:
@@ -221,6 +253,46 @@ def build_router(app: App) -> Router:
                 view = flow.render_error(w, flow.fmt_failure(exc.code, exc.message, exc.stderr, "la consulta"))
                 return await edit(bot, chat_id, message_id, view.text, view.keyboard)
         view = flow.render(w)
+        await edit(bot, chat_id, message_id, view.text, view.keyboard)
+
+    async def on_code(cb, bot, chat_id, message_id, parsed, event_update):
+        wid, action, arg = parsed
+        w = app.codes.get(wid, cb.from_user.id)
+        if w is None:
+            await cb.answer("La sesión expiró. Usa /codigo de nuevo.")
+            with contextlib.suppress(TelegramAPIError):
+                await edit(bot, chat_id, message_id, "La sesión expiró. Usa /codigo de nuevo.")
+            return
+        step = flow.advance_code(w, action, arg)
+        if step.kind == "invalid":
+            return await cb.answer(step.notice)
+        await cb.answer()
+        if step.kind == "cancel":
+            app.codes.drop(w.id)
+            return await edit(bot, chat_id, message_id, "Entrega cancelada.")
+        if step.kind == "run":
+            app.codes.drop(w.id)
+            req = flow.build_package_request(w)
+            await edit(bot, chat_id, message_id, flow.fmt_started(req))
+            return start_job(bot, chat_id, message_id, req, event_update.update_id)
+        if step.kind == "search_prompt":
+            w.chat_id, w.message_id = chat_id, message_id
+        elif step.kind == "fetch_branches":
+            try:
+                flow.set_branches(w, await app.gitlab.branches(w.project["name"]))
+            except RunnerError as exc:
+                flow.release(w)
+                w.step, w.project = "project", None
+                view = flow.render_code_error(w, flow.fmt_gitlab_failure(exc))
+                return await edit(bot, chat_id, message_id, view.text, view.keyboard)
+        elif step.kind == "fetch_tags":
+            try:
+                flow.set_tags(w, await app.gitlab.tags(w.project["name"]))
+            except RunnerError as exc:
+                flow.release(w)
+                view = flow.render_code_error(w, flow.fmt_gitlab_failure(exc))
+                return await edit(bot, chat_id, message_id, view.text, view.keyboard)
+        view = flow.render_code(w)
         await edit(bot, chat_id, message_id, view.text, view.keyboard)
 
     async def on_revoke(cb, bot, chat_id, message_id, link_id):

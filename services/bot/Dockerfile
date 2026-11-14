@@ -12,6 +12,7 @@ ARG APP_GID=10001
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     BOT_RUNNER_PATH=/app/runner/runner.sh \
+    BOT_GITLAB_FETCH=/app/gitlab/fetch.py \
     BOT_DATA_DIR=/data
 
 # flock viene en util-linux, ya incluido en la imagen base
@@ -29,6 +30,7 @@ COPY services/bot/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.txt
 
 COPY services/runner/ /app/runner/
+COPY services/gitlab/ /app/gitlab/
 COPY services/bot/bot/ /app/bot/
 RUN chmod 0755 /app/runner/runner.sh
 

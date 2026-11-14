@@ -42,14 +42,14 @@ def _check(ctx, link_id, began, sent):
         raise _Abort("slow_client")
 
 
-async def send(request, ctx, link, session_id, fd, size, rng):
+async def send(request, ctx, link, item, session_id, fd, size, rng):
     ip, ua = client_info(request)
     start, end = rng if rng else (0, size - 1)
     length = end - start + 1
     resp = web.StreamResponse(status=206 if rng else 200)
     resp.content_length = length
     resp.content_type = "application/octet-stream"
-    resp.headers["Content-Disposition"] = f'attachment; filename="{safe_filename(link["filename"])}"'
+    resp.headers["Content-Disposition"] = f'attachment; filename="{safe_filename(item["filename"])}"'
     resp.headers["Accept-Ranges"] = "bytes"
     if rng:
         resp.headers["Content-Range"] = f"bytes {start}-{end}/{size}"
@@ -59,13 +59,14 @@ async def send(request, ctx, link, session_id, fd, size, rng):
         return resp
 
     link_id = link["id"]
+    tag = {"file_index": item["idx"], "kind": item["kind"]}
     loop = asyncio.get_running_loop()
     began = ctx.clock()
     sent = last = 0
     finished = False
     try:
         await resp.prepare(request)
-        ctx.audit.log("download_started", link_id, ip, ua, length, range=f"{start}-{end}")
+        ctx.audit.log("download_started", link_id, ip, ua, length, range=f"{start}-{end}", **tag)
         while sent < length:
             _check(ctx, link_id, began, sent)
             want = min(ctx.config.block_size, length - sent)
@@ -78,11 +79,11 @@ async def send(request, ctx, link, session_id, fd, size, rng):
         await resp.write_eof()
         finished = True
     except asyncio.CancelledError:
-        ctx.audit.log("download_aborted", link_id, ip, ua, sent)
+        ctx.audit.log("download_aborted", link_id, ip, ua, sent, **tag)
         raise
     except (OSError, _Truncated, TimeoutError, _Abort) as exc:
         reason = exc.reason if isinstance(exc, _Abort) else type(exc).__name__
-        ctx.audit.log("download_aborted", link_id, ip, ua, sent, reason=reason)
+        ctx.audit.log("download_aborted", link_id, ip, ua, sent, reason=reason, **tag)
         if request.transport is not None:
             request.transport.close()
     finally:
@@ -95,5 +96,5 @@ async def send(request, ctx, link, session_id, fd, size, rng):
             ctx.config.post_download_grace,
         ))
     if counted:
-        ctx.audit.log("download_completed", link_id, ip, ua, size)
+        ctx.audit.log("download_completed", link_id, ip, ua, size, **tag)
     return resp

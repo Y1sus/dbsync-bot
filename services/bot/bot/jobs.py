@@ -4,12 +4,14 @@
 # =============================================================================
 
 import asyncio
+import contextlib
 import logging
 import secrets
 import time
 from dataclasses import dataclass, field
 
 from .gateway_client import GatewayError
+from .packages import PackageOutcome, PackageRequest, file_specs, run_parts
 from .runner_client import JOB_ID_RE, RunnerError
 
 log = logging.getLogger("bot.jobs")
@@ -53,11 +55,13 @@ class RunningJob:
     container: str
     db: str
     started: float = field(default_factory=time.monotonic)
+    label: str = ""
 
 
 class JobManager:
-    def __init__(self, runner, gateway, audit, max_jobs=1):
+    def __init__(self, runner, gateway, audit, max_jobs=1, gitlab=None):
         self.runner = runner
+        self.gitlab = gitlab
         self.gateway = gateway
         self.audit = audit
         self._sem = asyncio.Semaphore(max_jobs)
@@ -75,13 +79,16 @@ class JobManager:
         for task in list(self._tasks):
             task.cancel()
         self.runner.kill_all()
+        if self.gitlab is not None:
+            self.gitlab.kill_all()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
 
     def status(self):
         return list(self.running.values()), self.waiting
 
-    async def run(self, req: DumpRequest, job_id: str, on_queued=None, on_start=None) -> Outcome:
+    @contextlib.asynccontextmanager
+    async def _slot(self, on_queued, on_start):
         queued = self._sem.locked()
         if queued:
             self.waiting += 1
@@ -96,9 +103,16 @@ class JobManager:
         try:
             if queued and on_start:
                 await self._notify(on_start)
-            return await self._execute(req, job_id)
+            yield
         finally:
             self._sem.release()
+
+    async def run(self, req, job_id: str, on_queued=None, on_start=None):
+        """Un dump o un paquete: ambos ocupan un solo cupo de max_jobs."""
+        async with self._slot(on_queued, on_start):
+            if isinstance(req, PackageRequest):
+                return await self._execute_package(req, job_id)
+            return await self._execute(req, job_id)
 
     @staticmethod
     async def _notify(callback, *args):
@@ -130,7 +144,7 @@ class JobManager:
             label = f"{req.server}/{req.container}/{req.db}"
             try:
                 link = await self.gateway.create_link(
-                    relpath=dump["relpath"], sha256=dump["sha256"], created_by=req.user_id,
+                    files=[{"relpath": dump["relpath"], "sha256": dump["sha256"]}], created_by=req.user_id,
                     job_id=job_id, ttl_seconds=req.ttl, max_downloads=req.max_downloads, label=label,
                 )
             except GatewayError as exc:
@@ -139,5 +153,34 @@ class JobManager:
             self.audit.write("link_created", user_id=req.user_id, job_id=job_id, link_id=link["id"],
                              ttl_seconds=req.ttl, max_downloads=req.max_downloads)
             return Outcome("ok", job_id, dump=dump, link=link)
+        finally:
+            self.running.pop(job_id, None)
+
+    async def _execute_package(self, req: PackageRequest, job_id) -> PackageOutcome:
+        label = f"{req.project}@{req.ref}"
+        job = RunningJob(job_id, req.user_id, req.project, req.ref, req.what, label=f"{label} ({req.what})")
+        self.running[job_id] = job
+        self.audit.write("job_start", user_id=req.user_id, job_id=job_id, project=req.project, ref=req.ref, what=req.what)
+        try:
+            try:
+                parts = await run_parts(req, job_id, self.runner, self.gitlab)
+            except asyncio.CancelledError:
+                self.audit.write("job_end", user_id=req.user_id, job_id=job_id, ok=False, code="E_CANCELLED")
+                raise
+            codes = {p.kind: ("OK" if p.ok else p.code) for p in parts}
+            self.audit.write("job_end", user_id=req.user_id, job_id=job_id, ok=all(p.ok for p in parts), parts=codes)
+            if not any(p.ok for p in parts):
+                return PackageOutcome("failed", job_id, parts)
+            try:
+                link = await self.gateway.create_link(
+                    files=file_specs(parts), created_by=req.user_id, job_id=job_id,
+                    ttl_seconds=req.ttl, max_downloads=req.max_downloads, label=label,
+                )
+            except GatewayError as exc:
+                self.audit.write("link_failed", user_id=req.user_id, job_id=job_id, code=exc.code, status=exc.status)
+                return PackageOutcome("link_failed", job_id, parts, gateway_error=exc)
+            self.audit.write("link_created", user_id=req.user_id, job_id=job_id, link_id=link["id"],
+                             ttl_seconds=req.ttl, max_downloads=req.max_downloads, files=len(link["files"]))
+            return PackageOutcome("ok" if all(p.ok for p in parts) else "partial", job_id, parts, link=link)
         finally:
             self.running.pop(job_id, None)

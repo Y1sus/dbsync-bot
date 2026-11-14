@@ -20,9 +20,28 @@ class GatewayError(Exception):
         self.message = message
 
 
+KINDS = ("db", "code")
+
+
+def _check_file(f):
+    ok = (
+        isinstance(f, dict) and isinstance(f.get("index"), int) and not isinstance(f["index"], bool)
+        and 0 <= f["index"] <= 3 and isinstance(f.get("filename"), str) and f.get("kind") in KINDS
+        and isinstance(f.get("size_bytes"), int) and not isinstance(f["size_bytes"], bool)
+        and isinstance(f.get("downloads_completed"), int) and not isinstance(f["downloads_completed"], bool)
+    )
+    if not ok:
+        raise GatewayError(None, "bad_response", "Respuesta del gateway inválida.")
+
+
 def _check_record(rec, need_url=False):
     if not isinstance(rec, dict) or not isinstance(rec.get("id"), str) or not LINK_ID_RE.match(rec["id"]):
         raise GatewayError(None, "bad_response", "Respuesta del gateway inválida.")
+    files = rec.get("files")
+    if not isinstance(files, list) or not 1 <= len(files) <= 4:
+        raise GatewayError(None, "bad_response", "Respuesta del gateway inválida.")
+    for f in files:
+        _check_file(f)
     if need_url and not isinstance(rec.get("url"), str):
         raise GatewayError(None, "bad_response", "El gateway no devolvió la URL.")
     return rec
@@ -71,17 +90,19 @@ class GatewayClient:
             raise GatewayError(status, code, self._redact(msg))
         return data
 
-    async def create_link(self, relpath, sha256, created_by, job_id, ttl_seconds, max_downloads, label=None):
+    async def create_link(self, files, created_by, job_id, ttl_seconds, max_downloads, label=None):
+        """files: lista de {relpath, sha256} (1 a 4). max_downloads aplica a cada archivo."""
         body = {
-            "relpath": relpath, "sha256": sha256, "created_by": str(created_by), "job_id": job_id,
+            "files": [{"relpath": f["relpath"], "sha256": f["sha256"]} for f in files],
+            "created_by": str(created_by), "job_id": job_id,
             "ttl_seconds": ttl_seconds, "max_downloads": max_downloads,
         }
         if label:
             body["label"] = label[:120]
-        return _check_record(await self._request("POST", "/v1/links", (201,), json=body), need_url=True)
+        return _check_record(await self._request("POST", "/v2/links", (201,), json=body), need_url=True)
 
     async def list_links(self, state="active"):
-        data = await self._request("GET", "/v1/links", (200,), params={"state": state})
+        data = await self._request("GET", "/v2/links", (200,), params={"state": state})
         links = data.get("links") if isinstance(data, dict) else None
         if not isinstance(links, list):
             raise GatewayError(None, "bad_response", "Respuesta del gateway inválida.")
@@ -92,7 +113,7 @@ class GatewayClient:
         if not LINK_ID_RE.match(link_id):
             raise GatewayError(None, "invalid_request", "Id de enlace inválido.")
         params = {"keep_file": "1"} if keep_file else None
-        await self._request("DELETE", f"/v1/links/{link_id}", (204,), params=params)
+        await self._request("DELETE", f"/v2/links/{link_id}", (204,), params=params)
 
     async def health(self):
-        return await self._request("GET", "/v1/health", (200,))
+        return await self._request("GET", "/v2/health", (200,))

@@ -14,7 +14,8 @@ from aiogram.types import BotCommand
 
 from .audit import Audit
 from .config import ConfigError, load_config, read_secret
-from .flow import WizardStore
+from .flow import CodeStore, WizardStore
+from .gitlab_client import GitlabClient
 from .gateway_client import GatewayClient
 from .handlers import COMMANDS, App, AuthMiddleware, build_router
 from .jobs import JobManager
@@ -34,8 +35,9 @@ async def amain(redactor, env=None):
     audit = Audit(f"{cfg.data_dir.rstrip('/')}/audit.jsonl", redactor)
     runner = RunnerClient(cfg.runner_path, timeout=cfg.job_timeout, redactor=redactor)
     gateway = GatewayClient(cfg.gateway_url, gw_token, redactor=redactor)
-    jobs = JobManager(runner, gateway, audit, cfg.max_jobs)
-    app = App(cfg, runner, gateway, jobs, WizardStore(), audit)
+    gitlab = GitlabClient(cfg.gitlab_fetch, timeout=cfg.job_timeout, redactor=redactor)
+    jobs = JobManager(runner, gateway, audit, cfg.max_jobs, gitlab)
+    app = App(cfg, runner, gateway, jobs, WizardStore(), audit, gitlab, CodeStore())
 
     session = AiohttpSession(api=TelegramAPIServer.from_base(cfg.telegram_api_base)) if cfg.telegram_api_base else AiohttpSession()
     bot = Bot(bot_token, session=session)

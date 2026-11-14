@@ -9,6 +9,9 @@
 
 import asyncio
 import hashlib
+import importlib.util
+import io
+import json
 import os
 import re
 import shutil
@@ -17,6 +20,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import zipfile
 
 import aiohttp
 
@@ -24,10 +28,20 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "services", "bot"))
 
 from bot.audit import Audit  # noqa: E402
+from bot.gitlab_client import GitlabClient  # noqa: E402
+from bot.packages import PackageRequest  # noqa: E402
 from bot.gateway_client import GatewayClient  # noqa: E402
 from bot.jobs import DumpRequest, JobManager  # noqa: E402
 from bot.runner_client import RunnerClient  # noqa: E402
 
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+GL_TESTS = os.path.join(ROOT, "services", "gitlab", "tests")
 SHIMS = os.path.join(ROOT, "services", "runner", "tests", "shims")
 RUNNER = os.path.join(ROOT, "services", "runner", "runner.sh")
 GATEWAY_TOKEN = "gw-token-de-prueba-0123456789abcdef"
@@ -109,6 +123,29 @@ async def main():
         audit = Audit(os.path.join(tmp, "bot-data", "audit.jsonl"))
         jobs = JobManager(runner, gateway, audit, max_jobs=1)
 
+        gl_fake_mod = _load("gitlab_fake", os.path.join(GL_TESTS, "fakes", "gitlab_fake.py"))
+        fakegl = gl_fake_mod.FakeGitLab()
+        zbuf = io.BytesIO()
+        with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("proj/readme.txt", b"hola " * 20000)
+            zf.writestr("proj/src/app.php", b"<?php echo 1;" * 500)
+        zip_bytes = zbuf.getvalue()
+        fakegl.add_project("grp/proj", commits={"main": gl_fake_mod.SHA}, archives={"zip": zip_bytes},
+                           branches=["main"])
+        gl_token = os.path.join(tmp, "gitlab_token")
+        with open(gl_token, "w") as f:
+            f.write(gl_fake_mod.TOKEN + "\n")
+        os.chmod(gl_token, 0o600)
+        gl_catalog = os.path.join(tmp, "projects.json")
+        with open(gl_catalog, "w") as f:
+            json.dump({"projects": [{"name": "proj", "path": "grp/proj",
+                                     "db": {"server": "gate", "container": "fakemysql", "db": "appdb"}}]}, f)
+        gitlab = GitlabClient(os.path.join(ROOT, "services", "gitlab", "fetch.py"), timeout=60, env={
+            "GITLAB_BASE_URL": fakegl.url, "GITLAB_ALLOW_HTTP": "1", "GITLAB_TOKEN_FILE": gl_token,
+            "GITLAB_PROJECTS_FILE": gl_catalog, "DBSYNC_DUMPS_DIR": os.path.join(tmp, "dumps"),
+            "DBSYNC_MIN_FREE_MB": "1", "GITLAB_MAX_ARCHIVE_MB": "50"})
+        pkg_jobs = JobManager(runner, gateway, audit, max_jobs=1, gitlab=gitlab)
+
         print("== 1. runner real -> JobManager del bot -> gateway real")
         out = await jobs.run(DumpRequest(user_id=506679030, server="gate", container="fakemysql", db="appdb",
                                          ttl=3600, max_downloads=1), "tg1-abcd1234")
@@ -123,7 +160,7 @@ async def main():
         check("el dump del runner quedó 0600", oct(os.stat(file_path).st_mode & 0o777) == "0o600")
         check("el enlace usa la URL pública configurada", link["url"].startswith(base + "/d/"))
         size = dump["size_bytes"]
-        check("el tamaño del enlace coincide con el dump", link["size_bytes"] == size)
+        check("el tamaño del enlace coincide con el dump", link["files"][0]["size_bytes"] == size)
 
         async with aiohttp.ClientSession() as http:
             landing = f"{base}/d/{token}"
@@ -140,7 +177,7 @@ async def main():
             async with http.get(f"{base}/d/{'x' * 43}") as r:
                 check("token desconocido: 404", r.status == 404)
             rec = (await gateway.list_links("all"))[0]
-            check("después de GET/HEAD: 0 descargas contadas", rec["downloads_completed"] == 0)
+            check("después de GET/HEAD: 0 descargas contadas", rec["files"][0]["downloads_completed"] == 0)
 
             print("== 3. POST abre sesión; dos POST reutilizan la misma")
             async with http.post(landing, allow_redirects=False) as r:
@@ -152,7 +189,7 @@ async def main():
             async with http.head(session_url) as r:
                 check("HEAD de sesión: 200 y no cuenta", r.status == 200)
             check("HEAD de sesión no cuenta",
-                  (await gateway.list_links("all"))[0]["downloads_completed"] == 0)
+                  (await gateway.list_links("all"))[0]["files"][0]["downloads_completed"] == 0)
 
             print("== 4. descarga en dos rangos (el último primero)")
             half = size // 2
@@ -160,20 +197,20 @@ async def main():
                 await r.read()
                 check("sonda Range bytes=-1: 206", r.status == 206)
             check("la sonda de 1 byte no cuenta como descarga",
-                  (await gateway.list_links("all"))[0]["downloads_completed"] == 0)
+                  (await gateway.list_links("all"))[0]["files"][0]["downloads_completed"] == 0)
             async with http.get(session_url, headers={"Range": f"bytes={half}-"}) as r:
                 part2 = await r.read()
                 check("rango final: 206 con Content-Range", r.status == 206
                       and r.headers.get("Content-Range") == f"bytes {half}-{size - 1}/{size}")
             mid = (await gateway.list_links("all"))[0]
-            check("con solo la mitad final la cobertura no está completa: aún no cuenta", mid["downloads_completed"] == 0)
+            check("con solo la mitad final la cobertura no está completa: aún no cuenta", mid["files"][0]["downloads_completed"] == 0)
             async with http.get(session_url, headers={"Range": f"bytes=0-{half - 1}"}) as r:
                 part1 = await r.read()
                 check("rango inicial: 206", r.status == 206)
             blob = part1 + part2
             check("el reensamblado coincide con sha256 del runner", hashlib.sha256(blob).hexdigest() == dump["sha256"])
             rec = (await gateway.list_links("all"))[0]
-            check("al completarse la cobertura de bytes cuenta una sola vez", rec["downloads_completed"] == 1, rec)
+            check("al completarse la cobertura de bytes cuenta una sola vez", rec["files"][0]["downloads_completed"] == 1, rec)
             check("el enlace queda agotado", rec["state"] == "exhausted")
 
             print("== 5. la sesión sigue sirviendo; un POST nuevo no")
@@ -185,7 +222,7 @@ async def main():
             async with http.get(session_url, headers={"Range": "bytes=0-0"}) as r:
                 check("presupuesto de la sesión agotado: 410", r.status == 410, r.status)
             rec = (await gateway.list_links("all"))[0]
-            check("repetir en la sesión no suma", rec["downloads_completed"] == 1)
+            check("repetir en la sesión no suma", rec["files"][0]["downloads_completed"] == 1)
             async with http.post(landing, allow_redirects=False) as r:
                 check("POST nuevo con el enlace agotado: 410", r.status == 410)
 
@@ -281,6 +318,87 @@ async def main():
                 async with http.post(f"{base}/d/{t}", headers=headers, allow_redirects=False) as r:
                     check(f"POST {desc}: {want}", r.status == want, r.status)
 
+            print("== 11. paquete 'Ambos': runner + servicio GitLab real + bot + gateway (enlace de 2 archivos)")
+            preq = PackageRequest(user_id=506679030, project="proj", ref="main", sha=gl_fake_mod.SHA[:8], fmt="zip",
+                                  what="both", ttl=3600, max_downloads=1, db=("gate", "fakemysql", "appdb"))
+            pk = await pkg_jobs.run(preq, "tg-pkg-abcd1234")
+            check("el paquete termina 'ok' (código + BD)", pk.kind == "ok", f"{pk.kind} {[(p.kind, p.ok, p.code) for p in pk.parts]}")
+            files = pk.link["files"]
+            check("un solo enlace con 2 archivos: código y BD", [f["kind"] for f in files] == ["code", "db"], files)
+            check("el zip vive en _gitlab/ y el dump en su servidor", files[0]["relpath"].startswith("_gitlab/") and files[1]["relpath"].startswith("gate/"))
+            pcommit = pk.parts[0].result["commit"] if pk.parts[0].kind == "code" else None
+            check("el servicio fijó el commit confirmado", pcommit == gl_fake_mod.SHA)
+            ptoken = re.search(r"/d/([^/?#]+)$", pk.link["url"]).group(1)
+            zip_path = os.path.join(tmp, "dumps", files[0]["relpath"])
+            db_path = os.path.join(tmp, "dumps", files[1]["relpath"])
+            check("sha256 del zip y del dump coinciden con lo registrado", sha(zip_path) == files[0]["sha256"] and sha(db_path) == files[1]["sha256"])
+            r = await http.get(f"{base}/d/{ptoken}")
+            body = await r.text()
+            check("la página lista los 2 archivos con un botón cada uno", r.status == 200 and body.count("<button") == 2 and files[0]["filename"] in body and files[1]["filename"] in body)
+            check("el título no revela nombres", files[0]["filename"] not in body.split("</title>")[0])
+            for path, want, desc in ((f"/d/{ptoken}", 404, "POST sin índice en enlace de 2 archivos: 404"),
+                                     (f"/d/{ptoken}/2", 404, "POST con índice inexistente (2): 404"),
+                                     (f"/d/{ptoken}/9", 404, "POST con índice inexistente (9): 404")):
+                async with http.post(base + path, allow_redirects=False) as r:
+                    check(desc, r.status == want, r.status)
+            sess = []
+            for n in (0, 1):
+                async with http.post(f"{base}/d/{ptoken}/{n}", headers={"Origin": "null", "Sec-Fetch-Site": "same-origin"}, allow_redirects=False) as r:
+                    check(f"POST del archivo {n}: 303", r.status == 303, r.status)
+                    sess.append(base + r.headers["Location"])
+
+            async def fetch_all(url):
+                async with http.get(url) as r:
+                    return r.status, await r.read()
+
+            (s0, b0), (s1, b1) = await asyncio.gather(fetch_all(sess[0]), fetch_all(sess[1]))
+            check("descarga paralela de los 2 archivos: 200 y 200", (s0, s1) == (200, 200))
+            check("sha256 de lo descargado == lo registrado (zip y dump)", hashlib.sha256(b0).hexdigest() == files[0]["sha256"] and hashlib.sha256(b1).hexdigest() == files[1]["sha256"])
+            prec = [l for l in await gateway.list_links("all") if l["id"] == pk.link["id"]][0]
+            check("conteo por archivo [1, 1] y enlace agotado", [f["downloads_completed"] for f in prec["files"]] == [1, 1] and prec["state"] == "exhausted", prec)
+
+            print("== 12. entrega parcial: GitLab rechaza el token, la BD sí sale")
+
+            def deny_archive(h, rq):
+                if "/archive." in rq["raw_path"]:
+                    h.reply(403, b'{"message":"403 Forbidden"}')
+                    return True
+                return None
+
+            fakegl.responder = deny_archive
+            pp = await pkg_jobs.run(PackageRequest(user_id=506679030, project="proj", ref="main", sha=gl_fake_mod.SHA[:8], fmt="zip",
+                                                   what="both", ttl=3600, max_downloads=1, db=("gate", "fakemysql", "appdb")), "tg-part-abcd1234")
+            fakegl.responder = None
+            check("resultado 'partial' con el aviso del fallo de código", pp.kind == "partial" and [p.code for p in pp.bad] == ["E_FORBIDDEN"], f"{pp.kind} {[(p.kind, p.code) for p in pp.parts]}")
+            check("el enlace conserva solo la BD", [f["kind"] for f in pp.link["files"]] == ["db"])
+            async with http.get(pp.link["url"]) as r:
+                check("el enlace parcial se sirve (200)", r.status == 200)
+            await gateway.revoke(pp.link["id"])
+            fakegl.responder = deny_archive
+            pf = await pkg_jobs.run(PackageRequest(user_id=506679030, project="proj", ref="main", sha="", fmt="zip",
+                                                   what="code", ttl=3600, max_downloads=1), "tg-fail-abcd1234")
+            fakegl.responder = None
+            check("solo código y falla: 'failed' sin enlace", pf.kind == "failed" and pf.link is None, pf.kind)
+            check("GitLab recibió únicamente peticiones GET (nunca escritura, borrado ni creación)", set(fakegl.methods()) == {"GET"}, set(fakegl.methods()))
+            check("antes de operar se comprobaron los alcances del token", len(fakegl.scope_requests) >= 3)
+
+            if FULL:
+                print("== 13. borrado por archivo en un enlace de 2 archivos")
+                pk2 = await pkg_jobs.run(PackageRequest(user_id=506679030, project="proj", ref="main", sha="", fmt="zip",
+                                                        what="both", ttl=3600, max_downloads=1, db=("gate", "fakemysql", "appdb")), "tg-del-abcd1234")
+                f2 = pk2.link["files"]
+                zp2, dp2 = (os.path.join(tmp, "dumps", f["relpath"]) for f in f2)
+                t2 = re.search(r"/d/([^/?#]+)$", pk2.link["url"]).group(1)
+                async with http.post(f"{base}/d/{t2}/1", allow_redirects=False) as r:
+                    dl_url = base + r.headers["Location"]
+                async with http.get(dl_url) as r:
+                    await r.read()
+                check("solo se descargó el dump: el zip sigue disponible", os.path.exists(zp2))
+                check("el dump agotado se borra tras la gracia", await gone(dp2, 9))
+                check("mientras el zip sigue en el enlace vigente, no se borra", os.path.exists(zp2))
+                await gateway.revoke(pk2.link["id"])
+                check("revocar el enlace libera el zip restante", await gone(zp2, 4))
+
         print("== 8. el token nunca queda en logs ni en auditorías")
         await asyncio.sleep(0.3)
         haystack = ""
@@ -293,6 +411,10 @@ async def main():
         check("la auditoría del gateway registra la descarga",
               '"download_completed"' in open(os.path.join(tmp, "gw-data", "audit.jsonl")).read())
     finally:
+        try:
+            fakegl.close()
+        except NameError:
+            pass
         await gateway.close()
         if gw.returncode is None:
             gw.terminate()

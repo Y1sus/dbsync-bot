@@ -4,6 +4,8 @@
 # aquí, las envía con docker save | load, copia el código del HEAD y reinicia el
 # compose sin compilar en el servidor (el VPS tiene 1 vCPU y poca RAM).
 # Uso: scripts/deploy.sh [--dry-run] [--allow-dirty] usuario@host [directorio_remoto]
+# Antes de reiniciar guarda las imágenes anteriores como :previous y respalda gateway.db.
+# No copia secretos ni projects.json: se suben aparte con scp (ver deploy/README.md).
 # Solo toca <directorio_remoto> (default dbsync-bot) y los contenedores dbsync-bot-*.
 # Autor: Jesús Montalvo <jmontalvo_m@outlook.com>
 # =============================================================================
@@ -46,6 +48,15 @@ fi
 export DBSYNC_UID="$uid" DBSYNC_GID="$gid"
 
 run "construir imágenes con UID $uid:$gid" docker compose build -q || exit 1
+
+# Respaldos para poder volver atrás: la imagen anterior (tag :previous) y la base del gateway,
+# porque una migración de esquema nueva no la puede leer la imagen anterior.
+BACKUP_PY="import sqlite3;s=sqlite3.connect('/data/gateway.db');d=sqlite3.connect('/data/gateway.db.bak');s.backup(d);d.close();s.close()"
+run "guardar las imágenes actuales como :previous" "${SSH[@]}" \
+    "docker tag dbsync-bot-gateway:local dbsync-bot-gateway:previous 2>/dev/null; docker tag dbsync-bot-bot:local dbsync-bot-bot:previous 2>/dev/null; true" || exit 1
+run "respaldar gateway.db (data/gateway/gateway.db.bak)" "${SSH[@]}" \
+    "cd ~/$dir 2>/dev/null && if docker compose ps -q gateway 2>/dev/null | grep -q .; then docker compose exec -T gateway python -c \"$BACKUP_PY\"; fi" \
+    || { echo "No se pudo respaldar gateway.db: se cancela el despliegue" >&2; exit 1; }
 if (( dry )); then
     echo "-> enviar imágenes"; echo "   [dry-run] docker save ... | gzip | ssh $target 'gunzip | docker load'"
     echo "-> copiar código"; echo "   [dry-run] git archive HEAD | ssh $target 'tar -x -C ~/$dir'"

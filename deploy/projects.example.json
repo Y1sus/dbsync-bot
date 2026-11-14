@@ -1,0 +1,98 @@
+{
+  "projects": [
+    {
+      "name": "maruichimex",
+      "path": "erps6914234/maruichimex",
+      "db": {
+        "server": "devimed",
+        "container": "mysql8",
+        "db": "maruichimex_develop"
+      }
+    },
+    {
+      "name": "mcallen",
+      "path": "desarrollo_lionsystems/mcallen",
+      "db": {
+        "server": "devlion",
+        "container": "mcallen-mysql",
+        "db": "mcallen_develop"
+      }
+    },
+    {
+      "name": "everest",
+      "path": "desarrollo_lionsystems/everest",
+      "db": {
+        "server": "devimed",
+        "container": "mysql8",
+        "db": "everest_develop"
+      }
+    },
+    {
+      "name": "quesos-lucy",
+      "path": "desarrollo_lionsystems/quesos-lucy",
+      "db": {
+        "server": "devimed",
+        "container": "mysql8",
+        "db": "quesoslucy_develop"
+      }
+    },
+    {
+      "name": "quesos-arturo",
+      "path": "erps6914234/quesos-arturo",
+      "db": {
+        "server": "devimed",
+        "container": "mysql8",
+        "db": "quesosarturo_develop"
+      }
+    },
+    {
+      "name": "ecommerce-ba",
+      "path": "desarrollo_lionsystems/ecommerce-ba",
+      "db": {
+        "server": "devimed",
+        "container": "mysql8",
+        "db": "ecommerce_ba"
+      }
+    },
+    {
+      "name": "core-ba",
+      "path": "desarrollo_lionsystems/core-ba",
+      "db": {
+        "server": "devimed",
+        "container": "mysql8",
+        "db": "core_ba"
+      }
+    },
+    {
+      "name": "cotizador-graficas",
+      "path": "desarrollo_lionsystems/especialidades-graficas-cotizador",
+      "db": {
+        "server": "devimed",
+        "container": "mysql8",
+        "db": "especialidadesgraficas_develop"
+      }
+    },
+    {
+      "name": "puntoventa-lion",
+      "path": "desarrollo_lionsystems/puntoventa-lion-erp",
+      "db": {
+        "server": "devimed",
+        "container": "mysql8",
+        "db": "puntoventalion_develop"
+      }
+    },
+    {
+      "name": "ima",
+      "path": "desarrollo_lionsystems/ima",
+      "db": {
+        "server": "devimed",
+        "container": "mysql8",
+        "db": "ima_develop"
+      }
+    },
+    {
+      "name": "server-monitor",
+      "path": "servidores-lion/server-monitor"
+    }
+  ]
+}

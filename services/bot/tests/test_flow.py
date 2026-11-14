@@ -237,7 +237,7 @@ class MessageTests(unittest.TestCase):
             self.assertNotIn("eliminado", text)
 
     def test_links_view_mentions_purge_and_notice(self):
-        rec = [{"id": "0123456789ab", "filename": "f", "expires_at": "2026-11-13T18:00:00Z", "downloads_completed": 0, "max_downloads": 1}]
+        rec = [{"id": "0123456789ab", "files": [{"index": 0, "filename": "f", "kind": "db", "size_bytes": 1, "downloads_completed": 0}], "expires_at": "2026-11-13T18:00:00Z", "max_downloads": 1}]
         self.assertIn("Al revocar o al vencer un enlace se elimina el dump.", flow.fmt_links(rec).text)
         v = flow.fmt_links([], notice=flow.REVOKED_NOTE)
         self.assertTrue(v.text.startswith(flow.REVOKED_NOTE))
@@ -266,14 +266,26 @@ class MessageTests(unittest.TestCase):
         self.assertIn("conectar con el gateway", text)
 
     def test_links_view(self):
-        recs = [{"id": f"{i:012x}", "filename": HOSTILE, "expires_at": "2026-11-13T18:00:00Z", "downloads_completed": 1, "max_downloads": 3}
-                for i in range(12)]
-        v = flow.fmt_links(recs)
+        def rec(i):
+            files = [{"index": 0, "filename": HOSTILE, "kind": "code", "size_bytes": 2048, "downloads_completed": 1},
+                     {"index": 1, "filename": "f.sql.gz", "kind": "db", "size_bytes": 4096, "downloads_completed": 0}]
+            return {"id": f"{i:012x}", "label": HOSTILE, "files": files, "expires_at": "2026-11-13T18:00:00Z", "max_downloads": 3}
+        v = flow.fmt_links([rec(i) for i in range(12)])
         self.assertEqual(len(v.keyboard), 10)
         self.assertIn("y 2 más", v.text)
         self.assertNotIn("<script>", v.text)
+        self.assertIn("descargas 1/3", v.text)
+        self.assertIn("descargas 0/3", v.text)
+        self.assertIn("📦", v.text)
+        self.assertIn("🗄", v.text)
         self.assertEqual(flow.parse_callback(v.keyboard[0][0].data), ("r", "000000000000"))
         self.assertEqual(flow.fmt_links([]).keyboard, [])
+
+    def test_links_view_fits_telegram_limit(self):
+        files = [{"index": i, "filename": "x" * 200, "kind": "code", "size_bytes": 1, "downloads_completed": 0} for i in range(4)]
+        recs = [{"id": f"{i:012x}", "files": files, "expires_at": "2026-11-13T18:00:00Z", "max_downloads": 3} for i in range(10)]
+        v = flow.fmt_links(recs)
+        self.assertLessEqual(len(v.text), 4096)
 
     def test_servers_and_status(self):
         v = flow.fmt_servers([{"name": HOSTILE, "host": "h", "access_mode": "docker"}])

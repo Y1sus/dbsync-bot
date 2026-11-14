@@ -16,8 +16,11 @@ from .store import Store
 
 
 class ActiveStreams:
+    """Streams en curso por (enlace, archivo); el tope por enlace cuenta el total de sus archivos."""
+
     def __init__(self):
-        self._counts = Counter()
+        self._files = Counter()
+        self._links = Counter()
         self._total = 0
         self._lock = threading.Lock()
 
@@ -25,25 +28,32 @@ class ActiveStreams:
     def total(self):
         return self._total
 
-    def enter(self, link_id):
+    def enter(self, link_id, idx=0):
         with self._lock:
-            self._counts[link_id] += 1
+            self._files[(link_id, idx)] += 1
+            self._links[link_id] += 1
             self._total += 1
 
-    def exit(self, link_id):
+    def exit(self, link_id, idx=0):
         with self._lock:
             self._total -= 1
-            self._counts[link_id] -= 1
-            if self._counts[link_id] <= 0:
-                del self._counts[link_id]
+            for counter, key in ((self._files, (link_id, idx)), (self._links, link_id)):
+                counter[key] -= 1
+                if counter[key] <= 0:
+                    del counter[key]
 
-    def count(self, link_id):
+    def count(self, link_id, idx=None):
+        """Streams del enlace completo (idx None) o de un archivo."""
         with self._lock:
-            return self._counts.get(link_id, 0)
+            if idx is None:
+                return self._links.get(link_id, 0)
+            return self._files.get((link_id, idx), 0)
 
-    def busy(self, link_id):
+    def busy(self, link_id, idx=None):
         with self._lock:
-            return self._counts.get(link_id, 0) > 0
+            if idx is None:
+                return self._links.get(link_id, 0) > 0
+            return self._files.get((link_id, idx), 0) > 0
 
 
 class Context:

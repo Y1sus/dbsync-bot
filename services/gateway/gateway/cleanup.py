@@ -12,33 +12,41 @@ from . import paths
 
 log = logging.getLogger("gateway.cleanup")
 
-SUFFIX = ".sql.gz"
 
 
-def _scan(root):
-    """Dumps finales regulares en <raiz>/<servidor>/*.sql.gz; sin symlinks ni ocultos."""
+def _entries(root, wanted):
+    """Archivos regulares de <raiz>/<fuente>/ cuyo nombre cumple `wanted`; sin symlinks ni ocultos."""
     found = []
     try:
-        servers = list(os.scandir(root))
+        sources = list(os.scandir(root))
     except OSError:
         return found
-    for server in servers:
-        if server.name.startswith(".") or server.is_symlink() or not server.is_dir(follow_symlinks=False):
+    for source in sources:
+        if source.name.startswith(".") or source.is_symlink() or not source.is_dir(follow_symlinks=False):
             continue
         try:
-            entries = list(os.scandir(server.path))
+            entries = list(os.scandir(source.path))
         except OSError:
             continue
         for entry in entries:
-            if entry.name.startswith(".") or not entry.name.endswith(SUFFIX):
+            if not wanted(entry.name):
                 continue
             try:
                 info = entry.stat(follow_symlinks=False)
             except OSError:
                 continue
             if stat.S_ISREG(info.st_mode):
-                found.append((f"{server.name}/{entry.name}", entry.path, info.st_mtime, info.st_size))
+                found.append((f"{source.name}/{entry.name}", entry.path, info.st_mtime, info.st_size))
     return found
+
+
+def _scan(root):
+    """Archivos finales regulares en <raiz>/<fuente>/*.{sql.gz,zip,tar.gz}; sin symlinks ni ocultos."""
+    return _entries(root, paths.is_final_name)
+
+
+def _scan_parts(root):
+    return _entries(root, lambda name: not name.startswith(".") and name.endswith(".part"))
 
 
 def _unlink(ctx, relpath, path):
@@ -54,11 +62,11 @@ def _unlink(ctx, relpath, path):
 
 
 def _busy(ctx, status):
-    return any(ctx.active.busy(link_id) for link_id in status["link_ids"])
+    return any(ctx.active.busy(link_id, idx) for link_id, idx in status["refs"])
 
 
 def delete_finished(ctx, relpath, now, reason=None, path=None):
-    """Regla sin estado: borra el dump si todos sus enlaces son terminales y nada lo usa.
+    """Regla sin estado por archivo: borra si ningún enlace vigente lo tiene con descargas disponibles.
 
     Devuelve la razón de borrado o None. Se evalúa bajo el candado de create_link.
     """
@@ -66,8 +74,8 @@ def delete_finished(ctx, relpath, now, reason=None, path=None):
         status = ctx.store.file_status(relpath, now)
         if not status["all_terminal"] or status["kept"] or status["open_sessions"] or _busy(ctx, status):
             return None
-        _, link_id, state = status["last"]
-        reason = reason or f"link_{state}"
+        _, link_id, last_reason = status["last"]
+        reason = reason or last_reason
         if not _unlink(ctx, relpath, path):
             return None
         ctx.audit.log("file_deleted", link_id, relpath=relpath, reason=reason)
@@ -94,8 +102,14 @@ def run_once(ctx, now=None):
     for link_id, reason in closed:
         ctx.audit.log("link_expired", link_id, reason=reason)
 
+    stale = 0
+    for relpath, path, mtime, _ in _scan_parts(cfg.dumps_root):
+        if now - mtime > cfg.stale_part_seconds and _unlink(ctx, relpath, path):
+            ctx.audit.log("file_deleted", relpath=relpath, reason="stale_part")
+            stale += 1
+
     files = sorted(_scan(cfg.dumps_root), key=lambda item: item[2])
-    deleted = 0
+    deleted = stale
     remaining = []
     for relpath, path, mtime, size in files:
         if delete_finished(ctx, relpath, now, path=path):

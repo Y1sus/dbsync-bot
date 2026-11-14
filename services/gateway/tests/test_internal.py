@@ -10,8 +10,8 @@ from .support import API_TOKEN, GatewayCase, load_defs, validate
 
 class AuthTests(GatewayCase):
     async def test_401_sin_token_o_incorrecto(self):
-        rutas = [("GET", "/v1/health"), ("GET", "/v1/links"), ("POST", "/v1/links"),
-                 ("GET", "/v1/links/abc"), ("DELETE", "/v1/links/abc"), ("GET", "/no-existe")]
+        rutas = [("GET", "/v2/health"), ("GET", "/v2/links"), ("POST", "/v2/links"),
+                 ("GET", "/v2/links/abc"), ("DELETE", "/v2/links/abc"), ("GET", "/no-existe")]
         defs = load_defs()
         for method, path in rutas:
             for token in (None, "incorrecto", API_TOKEN[:-1], API_TOKEN + "x", "ñandú"):
@@ -21,13 +21,13 @@ class AuthTests(GatewayCase):
                     self.assertEqual(resp.status, 401, f"{method} {path} {token}")
                     self.assertEqual(validate(body, defs["Error"], defs), [])
                     self.assertEqual(body["error"]["code"], "unauthorized")
-        async with self.http.get(self.int + "/v1/health", headers={"Authorization": API_TOKEN}) as resp:
+        async with self.http.get(self.int + "/v2/health", headers={"Authorization": API_TOKEN}) as resp:
             self.assertEqual(resp.status, 401)
-        async with self.http.get(self.int + "/v1/health", headers={"Authorization": "bearer " + API_TOKEN}) as resp:
+        async with self.http.get(self.int + "/v2/health", headers={"Authorization": "bearer " + API_TOKEN}) as resp:
             self.assertEqual(resp.status, 200)
 
     async def test_ruta_inexistente_con_token_404_json(self):
-        status, body = await self.api("GET", "/v1/nada")
+        status, body = await self.api("GET", "/v2/nada")
         self.assertEqual((status, body["error"]["code"]), (404, "not_found"))
 
 
@@ -38,23 +38,40 @@ class CrearTests(GatewayCase):
         self.assertEqual(validate(link, defs["LinkCreated"], defs), [])
         self.assertTrue(link["url"].startswith("https://dumps.example.test/d/"))
         self.assertEqual(len(link["token"]), 43)
-        self.assertEqual((link["size_bytes"], link["filename"], link["state"]), (1000, "a.sql.gz", "active"))
+        item = link["files"][0]
+        self.assertEqual((item["size_bytes"], item["filename"], item["kind"], item["index"]),
+                         (1000, "a.sql.gz", "db", 0))
+        self.assertEqual((item["sha256"], item["downloads_completed"], item["state"]), ("b" * 64, 0, "active"))
+        self.assertEqual(link["state"], "active")
         self.assertEqual((link["created_by"], link["label"], link["max_downloads"]), ("tester", "mi respaldo", 3))
         self.assertFalse(link["download_in_progress"])
-        _, one = await self.api("GET", f"/v1/links/{link['id']}")
+        _, one = await self.api("GET", f"/v2/links/{link['id']}")
         self.assertEqual(validate(one, defs["LinkRecord"], defs), [])
         self.assertNotIn("url", one)
-        _, listing = await self.api("GET", "/v1/links")
+        _, listing = await self.api("GET", "/v2/links")
         self.assertEqual(validate(listing, defs["LinkList"], defs), [])
-        _, health = await self.api("GET", "/v1/health")
+        _, health = await self.api("GET", "/v2/health")
         self.assertEqual(validate(health, defs["Health"], defs), [])
         self.assertEqual(health["links_active"], 1)
         self.assertGreater(health["disk_free_mb"], 0)
 
+    async def test_respuestas_de_dos_archivos_cumplen_esquema(self):
+        defs = load_defs()
+        self.write_dump("_gitlab/c.zip", b"z" * 600)
+        link = await self.create_link(files=[{"relpath": "srv/a.sql.gz", "sha256": "1" * 64},
+                                             {"relpath": "_gitlab/c.zip"}], max_downloads=2)
+        self.assertEqual(validate(link, defs["LinkCreated"], defs), [])
+        self.assertEqual([f["kind"] for f in link["files"]], ["db", "code"])
+        _, one = await self.api("GET", f"/v2/links/{link['id']}")
+        self.assertEqual(validate(one, defs["LinkRecord"], defs), [])
+        _, listing = await self.api("GET", "/v2/links?state=all")
+        self.assertEqual(validate(listing, defs["LinkList"], defs), [])
+        self.assertEqual(len(listing["links"][0]["files"]), 2)
+
     async def test_token_solo_se_devuelve_al_crear_y_se_guarda_hash(self):
         link = await self.create_link()
-        _, one = await self.api("GET", f"/v1/links/{link['id']}")
-        _, listing = await self.api("GET", "/v1/links?state=all")
+        _, one = await self.api("GET", f"/v2/links/{link['id']}")
+        _, listing = await self.api("GET", "/v2/links?state=all")
         self.assertNotIn(link["token"], str(one) + str(listing))
         rows = self.ctx.store._db.execute("SELECT * FROM links").fetchall()
         self.assertNotIn(link["token"], str([tuple(r) for r in rows]))
@@ -64,24 +81,39 @@ class CrearTests(GatewayCase):
         link = await self.create_link()
         self.assertEqual(link["max_downloads"], 1)
         self.assertEqual(link["expires_at"][:10], "2027-01-15")
-        self.assertIsNone(link["sha256"])
+        self.assertIsNone(link["files"][0]["sha256"])
         self.assertIsNone(link["label"])
+        self.assertNotIn("relpath", link)
 
     async def test_invalid_request(self):
-        base = {"relpath": "srv/a.sql.gz", "created_by": "t", "job_id": "j"}
+        base = {"files": [{"relpath": "srv/a.sql.gz"}], "created_by": "t", "job_id": "j"}
+
+        def with_file(**fields):
+            return {**base, "files": [{"relpath": "srv/a.sql.gz", **fields}]}
+
+        def with_rel(rel):
+            return {**base, "files": [{"relpath": rel}]}
+
         malos = [
-            {}, {**base, "extra": 1}, {**base, "relpath": 5}, {**base, "created_by": ""},
+            {}, {**base, "extra": 1}, {**base, "created_by": ""},
             {**base, "created_by": "x" * 65}, {**base, "job_id": 3}, {**base, "label": "x" * 121},
             {**base, "ttl_seconds": 59}, {**base, "ttl_seconds": 604801}, {**base, "ttl_seconds": True},
             {**base, "ttl_seconds": "3600"}, {**base, "max_downloads": 0}, {**base, "max_downloads": 21},
-            {**base, "sha256": "A" * 64}, {**base, "sha256": "abc"}, {**base, "relpath": "../x.sql.gz"},
-            {**base, "relpath": "/abs.sql.gz"}, {**base, "relpath": "srv/a.sql.gz.part"},
+            {"created_by": "t", "job_id": "j"}, {**base, "files": []}, {**base, "files": "srv/a.sql.gz"},
+            {**base, "files": [5]}, {**base, "files": [{}]}, {**base, "files": [{"relpath": 5}]},
+            {**base, "files": [{"relpath": "srv/a.sql.gz", "extra": 1}]},
+            with_file(sha256="A" * 64), with_file(sha256="abc"), with_file(sha256=5),
+            with_rel("../x.sql.gz"), with_rel("/abs.sql.gz"), with_rel("srv/a.sql.gz.part"),
+            with_rel("srv/a.exe"), with_rel("srv/a.sql"), with_rel("a/b/c.zip"), with_rel("gitlab/../x.zip"),
+            with_rel("solo.zip"), with_rel("srv/.oculto.zip"), with_rel(".locks/x.zip"), with_rel("srv\\a.zip"),
+            {**base, "files": [{"relpath": "srv/a.sql.gz"}] * 2},
+            {**base, "files": [{"relpath": f"srv/f{i}.zip"} for i in range(5)]},
             [1, 2], "texto",
         ]
         for body in malos:
-            status, data = await self.api("POST", "/v1/links", body)
+            status, data = await self.api("POST", "/v2/links", body)
             self.assertEqual((status, data["error"]["code"]), (400, "invalid_request"), body)
-        async with self.http.post(self.int + "/v1/links", data=b"{no json",
+        async with self.http.post(self.int + "/v2/links", data=b"{no json",
                                   headers={"Authorization": f"Bearer {API_TOKEN}"}) as resp:
             self.assertEqual(resp.status, 400)
 
@@ -89,19 +121,31 @@ class CrearTests(GatewayCase):
         self.write_dump("srv/x.sql.gz.part", b"parcial")
         os.symlink(self.dump_path, os.path.join(self.dumps, "srv", "ln.sql.gz"))
         base = {"created_by": "t", "job_id": "j"}
-        status, data = await self.api("POST", "/v1/links", {**base, "relpath": "srv/nope.sql.gz"})
+
+        def body(rel):
+            return {**base, "files": [{"relpath": rel}]}
+
+        status, data = await self.api("POST", "/v2/links", body("srv/nope.sql.gz"))
         self.assertEqual((status, data["error"]["code"]), (404, "file_not_found"))
-        status, data = await self.api("POST", "/v1/links", {**base, "relpath": "srv/ln.sql.gz"})
+        status, data = await self.api("POST", "/v2/links", body("srv/ln.sql.gz"))
         self.assertEqual((status, data["error"]["code"]), (404, "file_not_found"))
-        status, data = await self.api("POST", "/v1/links", {**base, "relpath": "srv/x.sql.gz.part"})
+        status, data = await self.api("POST", "/v2/links", body("srv/x.sql.gz.part"))
         self.assertEqual(status, 400)
-        self.assertEqual((await self.api("GET", "/v1/links?state=all"))[1]["links"], [])
+        status, data = await self.api("POST", "/v2/links", {**base, "files": [
+            {"relpath": "srv/a.sql.gz"}, {"relpath": "srv/falta.zip"}]})
+        self.assertEqual((status, data["error"]["code"]), (404, "file_not_found"))
+        self.assertEqual((await self.api("GET", "/v2/links?state=all"))[1]["links"], [])
 
     async def test_archivo_vacio_rechazado(self):
         self.write_dump("srv/vacio.sql.gz", b"")
-        status, data = await self.api("POST", "/v1/links",
-                                      {"relpath": "srv/vacio.sql.gz", "created_by": "t", "job_id": "j"})
+        status, data = await self.api("POST", "/v2/links", {
+            "files": [{"relpath": "srv/vacio.sql.gz"}], "created_by": "t", "job_id": "j"})
         self.assertEqual((status, data["error"]["code"]), (400, "invalid_request"))
+
+    async def test_v1_ya_no_existe(self):
+        for method, path in (("POST", "/v1/links"), ("GET", "/v1/links"), ("GET", "/v1/health")):
+            status, data = await self.api(method, path)
+            self.assertEqual((status, data["error"]["code"]), (404, "not_found"), path)
 
 
 class ListarYRevocarTests(GatewayCase):
@@ -111,49 +155,49 @@ class ListarYRevocarTests(GatewayCase):
         second = await self.create_link()
         self.clock.advance(1)
         third = await self.create_link()
-        _, active = await self.api("GET", "/v1/links")
+        _, active = await self.api("GET", "/v2/links")
         self.assertEqual([x["id"] for x in active["links"]], [third["id"], second["id"], first["id"]])
         self.clock.advance(100)
-        await self.api("DELETE", f"/v1/links/{second['id']}")
-        _, active = await self.api("GET", "/v1/links")
+        await self.api("DELETE", f"/v2/links/{second['id']}")
+        _, active = await self.api("GET", "/v2/links")
         self.assertEqual([x["id"] for x in active["links"]], [third["id"]])
-        _, everything = await self.api("GET", "/v1/links?state=all")
+        _, everything = await self.api("GET", "/v2/links?state=all")
         states = {x["id"]: x["state"] for x in everything["links"]}
         self.assertEqual(states, {first["id"]: "expired", second["id"]: "revoked", third["id"]: "active"})
-        status, data = await self.api("GET", "/v1/links?state=otro")
+        status, data = await self.api("GET", "/v2/links?state=otro")
         self.assertEqual((status, data["error"]["code"]), (400, "invalid_request"))
 
     async def test_get_y_delete_desconocidos(self):
-        for path in ("/v1/links/ffffffffffff", "/v1/links/noesid"):
+        for path in ("/v2/links/ffffffffffff", "/v2/links/noesid"):
             for method in ("GET", "DELETE"):
                 status, data = await self.api(method, path)
                 self.assertEqual((status, data["error"]["code"]), (404, "not_found"))
 
     async def test_delete_borra_el_archivo_y_es_idempotente(self):
         link = await self.create_link()
-        self.assertEqual((await self.api("DELETE", f"/v1/links/{link['id']}"))[0], 204)
+        self.assertEqual((await self.api("DELETE", f"/v2/links/{link['id']}"))[0], 204)
         self.assertFalse(os.path.exists(self.dump_path))
-        self.assertEqual((await self.api("DELETE", f"/v1/links/{link['id']}"))[0], 204)
-        self.assertEqual((await self.api("DELETE", "/v1/links/ffffffffffff"))[0], 404)
+        self.assertEqual((await self.api("DELETE", f"/v2/links/{link['id']}"))[0], 204)
+        self.assertEqual((await self.api("DELETE", "/v2/links/ffffffffffff"))[0], 404)
         self.assertIn("file_deleted", [e["event"] for e in self.audit_events()])
 
     async def test_delete_keep_file_conserva_el_archivo(self):
         link = await self.create_link()
-        self.assertEqual((await self.api("DELETE", f"/v1/links/{link['id']}?keep_file=1"))[0], 204)
+        self.assertEqual((await self.api("DELETE", f"/v2/links/{link['id']}?keep_file=1"))[0], 204)
         self.assertTrue(os.path.exists(self.dump_path))
         self.assertEqual((await self.link_state(link))["state"], "revoked")
 
     async def test_delete_respeta_otro_enlace_activo(self):
         a = await self.create_link()
         b = await self.create_link()
-        await self.api("DELETE", f"/v1/links/{a['id']}")
+        await self.api("DELETE", f"/v2/links/{a['id']}")
         self.assertTrue(os.path.exists(self.dump_path))
-        await self.api("DELETE", f"/v1/links/{b['id']}")
+        await self.api("DELETE", f"/v2/links/{b['id']}")
         self.assertFalse(os.path.exists(self.dump_path))
 
     async def test_parametro_delete_file_ya_no_existe(self):
         link = await self.create_link(max_downloads=2)
-        self.assertEqual((await self.api("DELETE", f"/v1/links/{link['id']}?delete_file=0"))[0], 204)
+        self.assertEqual((await self.api("DELETE", f"/v2/links/{link['id']}?delete_file=0"))[0], 204)
         self.assertFalse(os.path.exists(self.dump_path))
 
     async def test_download_in_progress(self):

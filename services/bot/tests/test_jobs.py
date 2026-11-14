@@ -67,8 +67,9 @@ class JobTests(unittest.IsolatedAsyncioTestCase):
         out = await jm.run(REQ, "tg1-aaaa1111")
         self.assertEqual(out.kind, "ok")
         body = self.gw.requests[-1]["body"]
-        self.assertEqual((body["relpath"], body["sha256"], body["created_by"], body["job_id"]),
-                         ("alpha/f.sql.gz", "a" * 64, "42", "tg1-aaaa1111"))
+        self.assertEqual(body["files"], [{"relpath": "alpha/f.sql.gz", "sha256": "a" * 64}])
+        self.assertEqual((body["created_by"], body["job_id"]), ("42", "tg1-aaaa1111"))
+        self.assertEqual(self.gw.requests[-1]["path"], "/v2/links")
         self.assertEqual((body["ttl_seconds"], body["max_downloads"], body["label"]), (7200, 3, "alpha/mysql8/appdb"))
         self.assertTrue(out.link["url"].startswith("https://dumps.test/d/"))
         self.assertEqual([e["event"] for e in self.audit_events()], ["job_start", "job_end", "link_created"])
@@ -87,7 +88,7 @@ class JobTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.audit_events()[-1]["ok"])
 
     async def test_timeout_outcome(self):
-        out = await self.manager("hang", timeout=0.15).run(REQ, "tg1-aaaa1111")
+        out = await self.manager("hang", timeout=0.06).run(REQ, "tg1-aaaa1111")
         self.assertEqual(out.code, "E_TIMEOUT")
         self.assertEqual(self.audit_events()[-1]["code"], "E_TIMEOUT")
 
@@ -113,7 +114,7 @@ class JobTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out.gateway_error.code, "unreachable")
 
     async def test_queue_respects_max_jobs_one(self):
-        jm = self.manager("slow", max_jobs=1, FAKE_SLEEP="0.12")
+        jm = self.manager("slow", max_jobs=1, FAKE_SLEEP="0.04")
         peak, queued_pos, started = [0], [], []
 
         async def watch():
@@ -129,9 +130,9 @@ class JobTests(unittest.IsolatedAsyncioTestCase):
 
         watcher = asyncio.create_task(watch())
         a = jm.spawn(jm.run(REQ, "tg1-aaaa0001", queued, start))
-        await asyncio.sleep(0.03)
+        await asyncio.sleep(0.012)
         b = jm.spawn(jm.run(REQ, "tg1-aaaa0002", queued, start))
-        await asyncio.sleep(0.03)
+        await asyncio.sleep(0.012)
         self.assertEqual(jm.status()[1], 1)
         oa, ob = await asyncio.gather(a, b)
         watcher.cancel()
@@ -142,7 +143,7 @@ class JobTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(jm.status(), ([], 0))
 
     async def test_max_jobs_two_runs_in_parallel(self):
-        jm = self.manager("slow", max_jobs=2, FAKE_SLEEP="0.12")
+        jm = self.manager("slow", max_jobs=2, FAKE_SLEEP="0.04")
         peak = [0]
 
         async def watch():
@@ -157,7 +158,7 @@ class JobTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(peak[0], 2)
 
     async def test_queue_callback_failure_does_not_break_job(self):
-        jm = self.manager("slow", FAKE_SLEEP="0.06")
+        jm = self.manager("slow", FAKE_SLEEP="0.03")
 
         async def boom(*a):
             raise RuntimeError("telegram caído")
@@ -171,7 +172,7 @@ class JobTests(unittest.IsolatedAsyncioTestCase):
     async def test_shutdown_cancels_jobs_and_kills_runner(self):
         jm = self.manager("hang", timeout=30, FAKE_PID_FILE=os.path.join(self.tmp.name, "pid"))
         task = jm.spawn(jm.run(REQ, "tg1-aaaa0001"))
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.05)
         self.assertEqual(len(jm.running), 1)
         await jm.shutdown()
         self.assertTrue(task.cancelled() or task.done())
@@ -181,7 +182,7 @@ class JobTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancel_releases_slot(self):
         jm = self.manager("hang", timeout=30)
         task = jm.spawn(jm.run(REQ, "tg1-aaaa0001"))
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.04)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         self.assertFalse(jm._sem.locked())

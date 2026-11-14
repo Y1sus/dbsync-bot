@@ -73,7 +73,7 @@ class CabecerasTests(GatewayCase):
                     self.assertEqual(resp.headers.get("Strict-Transport-Security"), esperado, (headers, url))
 
     async def test_api_interna_no_expone_version(self):
-        async with self.http.get(self.int + "/v1/health") as resp:
+        async with self.http.get(self.int + "/v2/health") as resp:
             self.assertNotIn("aiohttp", resp.headers.get("Server", ""))
             self.assertNotIn("Python", resp.headers.get("Server", ""))
 

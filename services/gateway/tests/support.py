@@ -130,21 +130,27 @@ class GatewayCase(unittest.IsolatedAsyncioTestCase):
             text = await resp.text()
             return resp.status, (json.loads(text) if text else None)
 
-    async def create_link(self, **overrides):
-        body = {"relpath": "srv/a.sql.gz", "created_by": "tester", "job_id": "job-1"}
+    async def create_link(self, relpath="srv/a.sql.gz", sha256=None, files=None, **overrides):
+        """Enlace v2; `relpath`/`sha256` arman un enlace de un archivo y `files` uno de varios."""
+        if files is None:
+            files = [{"relpath": relpath, **({"sha256": sha256} if sha256 else {})}]
+        body = {"files": files, "created_by": "tester", "job_id": "job-1"}
         body.update(overrides)
-        status, data = await self.api("POST", "/v1/links", body)
+        status, data = await self.api("POST", "/v2/links", body)
         self.assertEqual(status, 201, data)
         data["token"] = data["url"].rsplit("/d/", 1)[1]
         return data
 
-    async def open_session(self, link):
-        async with self.http.post(f"{self.pub}/d/{link['token']}", allow_redirects=False) as resp:
+    async def open_session(self, link, index=None):
+        """POST de sesión: sin índice usa la ruta de compatibilidad (enlaces de un archivo)."""
+        suffix = "" if index is None else f"/{index}"
+        async with self.http.post(f"{self.pub}/d/{link['token']}{suffix}", allow_redirects=False) as resp:
             self.assertEqual(resp.status, 303)
             return resp.headers["Location"]
 
-    async def post(self, link, headers=None):
-        async with self.http.post(f"{self.pub}/d/{link['token']}", headers=headers or {},
+    async def post(self, link, headers=None, index=None):
+        suffix = "" if index is None else f"/{index}"
+        async with self.http.post(f"{self.pub}/d/{link['token']}{suffix}", headers=headers or {},
                                   allow_redirects=False) as resp:
             await resp.read()
             return resp.status, dict(resp.headers)
@@ -171,7 +177,10 @@ class GatewayCase(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
 
     async def link_state(self, link):
-        return (await self.api("GET", f"/v1/links/{link['id']}"))[1]
+        """Registro v2; añade `downloads_completed` del primer archivo por comodidad en las pruebas."""
+        data = (await self.api("GET", f"/v2/links/{link['id']}"))[1]
+        data["downloads_completed"] = data["files"][0]["downloads_completed"]
+        return data
 
     def audit_events(self):
         with open(os.path.join(self.data, "audit.jsonl"), encoding="utf-8") as fh:

@@ -26,6 +26,6 @@ USER ${APP_UID}:${APP_GID}
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["python", "-c", "import os,sys,urllib.request as u;t=open(os.environ['GATEWAY_API_TOKEN_FILE']).read().strip();r=u.Request('http://127.0.0.1:%s/v1/health'%os.environ.get('GATEWAY_INTERNAL_PORT','8081'),headers={'Authorization':'Bearer '+t});sys.exit(0 if u.urlopen(r,timeout=4).status==200 else 1)"]
+    CMD ["python", "-c", "import os,sys,urllib.request as u;t=open(os.environ['GATEWAY_API_TOKEN_FILE']).read().strip();r=u.Request('http://127.0.0.1:%s/v2/health'%os.environ.get('GATEWAY_INTERNAL_PORT','8081'),headers={'Authorization':'Bearer '+t});sys.exit(0 if u.urlopen(r,timeout=4).status==200 else 1)"]
 
 CMD ["python", "-m", "gateway"]

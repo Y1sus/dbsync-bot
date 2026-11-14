@@ -20,7 +20,8 @@ cp "$T/bin/docker" "$T/bin/ssh"
 
 out="$(PATH="$T/bin:$PATH" DEPLOY_REPO_DIR="$T" "$SCRIPT" --dry-run u@h.example 2>&1)"; rc=$?
 check "dry-run: exit 0" 0 "$rc"
-[[ "$out" == *"construir imágenes"* && "$out" == *"docker load"* && "$out" == *"git archive HEAD"* && "$out" == *"up -d --no-build"* ]] && ok "dry-run lista los 4 pasos" || nok "dry-run lista los 4 pasos"
+[[ "$out" == *"construir imágenes"* && "$out" == *"docker load"* && "$out" == *"git archive HEAD"* && "$out" == *"up -d --no-build"* ]] && ok "dry-run lista los pasos principales" || nok "dry-run lista los pasos principales"
+[[ "$out" == *":previous"* && "$out" == *"gateway.db.bak"* ]] && ok "dry-run incluye los respaldos (imagen previa y gateway.db)" || nok "dry-run incluye los respaldos"
 check "dry-run no ejecuta ssh" 0 "$(grep -c 'STUB ssh' "$T/calls" 2>/dev/null || echo 0)"
 
 echo b > "$T/f"

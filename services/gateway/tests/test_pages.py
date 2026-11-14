@@ -15,7 +15,15 @@ from gateway.streaming import safe_filename
 from .support import GatewayCase
 
 KINDS = ["expired", "exhausted", "revoked", "session", "budget", "file", "notfound", "method", "busy", "forbidden",
-         "bad", "error", "limited"]
+         "bad", "error", "limited", "budget", "filedone"]
+
+
+TOKEN = "T" * 43
+
+
+def item(name, kind, index=0, left=1, sha="a" * 64, available=True):
+    return {"index": index, "filename": name, "kind": kind, "size_bytes": 2048, "sha256": sha,
+            "downloads_left": left, "available": available}
 
 
 def style_of(doc):
@@ -49,7 +57,8 @@ class PaginasUnitTests(unittest.TestCase):
         self.assertIn('<html lang="es">', doc)
         self.assertIn('<meta name="robots" content="noindex">', doc)
         self.assertIn('name="viewport"', doc)
-        self.assertIn(f'<meta name="description" content="{pages.DESCRIPTION}">', doc)
+        self.assertTrue(f'<meta name="description" content="{pages.DESCRIPTION}">' in doc
+                        or f'<meta name="description" content="{pages.LANDING_DESCRIPTION}">' in doc)
         self.assertEqual(style_of(doc), pages.CSS)
         if nombre:
             head = doc.split("</head>")[0]
@@ -60,7 +69,7 @@ class PaginasUnitTests(unittest.TestCase):
             status, doc = pages.render(kind, retry_after=90)
             self.check_doc(doc)
             self.assertGreaterEqual(status, 400, kind)
-        status, doc = pages.landing("x.sql.gz", 1000, "a" * 64, "2027-01-15 08:00 UTC", 3600, 1)
+        status, doc = pages.landing(TOKEN, [item("x.sql.gz", "db"), item("y.zip", "code")], "2027-01-15 08:00 UTC", 3600)
         self.assertEqual(status, 200)
         self.check_doc(doc)
 
@@ -98,7 +107,8 @@ class PaginasUnitTests(unittest.TestCase):
 
     def test_html_hostil_se_escapa(self):
         hostil = '<img src=x onerror=alert(1)>"\'&'
-        _, doc = pages.landing(hostil + ".sql.gz", 10, hostil, hostil, 10, 1)
+        _, doc = pages.landing(TOKEN, [item(hostil + ".sql.gz", "db", sha=hostil), item(hostil + ".zip", "code")],
+                               hostil, 10)
         self.assertNotIn("<img", doc)
         self.assertIn("&lt;img", doc)
         self.assertNotIn("onerror=alert(1)>", doc)
@@ -124,10 +134,54 @@ class PaginasHttpTests(GatewayCase):
             self.assertEqual(resp.headers["Content-Type"], "text/html; charset=utf-8")
         stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(self.clock() + 3540))
         for esperado in ("mi-respaldo.sql.gz", "2.0 KiB", "ab" * 32, stamp, "expira en 59 min",
-                         "Descargas restantes", "Descargar archivo", '<form method="post">'):
+                         "Descargas restantes", "Descargar", "Base de datos",
+                         f'<form method="post" action="/d/{link["token"]}/0">'):
             self.assertIn(esperado, page)
         self.assertRegex(page, r"Descargas restantes</dt><dd>3</dd>")
         self.assertIn('class="mono"', page)
+
+    async def test_pagina_con_dos_archivos(self):
+        nombre_db, nombre_zip = "cliente-secreto-db.sql.gz", "proyecto-secreto.zip"
+        self.write_dump(f"srv/{nombre_db}", b"d" * 100)
+        self.write_dump(f"_gitlab/{nombre_zip}", b"z" * 3000)
+        link = await self.create_link(files=[{"relpath": f"srv/{nombre_db}", "sha256": "1" * 64},
+                                             {"relpath": f"_gitlab/{nombre_zip}", "sha256": "2" * 64}],
+                                      max_downloads=2)
+        async with self.http.get(f"{self.pub}/d/{link['token']}") as resp:
+            page = await resp.text()
+            csp = resp.headers["Content-Security-Policy"]
+        head = page.split("</head>")[0]
+        for nombre in (nombre_db, nombre_zip, "secreto"):
+            self.assertNotIn(nombre, head)
+        self.assertIn("<title>Descarga lista</title>", head)
+        self.assertIn('content="Tus archivos están listos."', head)
+        for esperado in (nombre_db, nombre_zip, "Base de datos", "Código", "Tus archivos están listos", "1" * 64,
+                         "2" * 64, "2.9 KiB", f'action="/d/{link["token"]}/0"', f'action="/d/{link["token"]}/1"'):
+            self.assertIn(esperado, page)
+        self.assertEqual(page.count('<button class="btn"'), 2)
+        self.assertEqual(page.count("Descargas restantes</dt><dd>2</dd>"), 2)
+        self.assertNotIn("style=", page)
+        self.assertIn(f"style-src '{csp_hash(style_of(page))}'", csp)
+        self.assertEqual(page.count('<svg class="ico"'), 2 + 2 + 2)
+
+    async def test_archivo_agotado_o_borrado_no_ofrece_boton(self):
+        import os
+        self.write_dump("_gitlab/c.zip", b"z" * 500)
+        self.write_dump("srv/b.sql.gz", b"d" * 100)
+        link = await self.create_link(files=[{"relpath": "srv/a.sql.gz"}, {"relpath": "_gitlab/c.zip"},
+                                             {"relpath": "srv/b.sql.gz"}])
+        loc = await self.open_session(link, 0)
+        await self.fetch(loc)
+        await self.counted(link)
+        os.unlink(os.path.join(self.dumps, "_gitlab", "c.zip"))
+        async with self.http.get(f"{self.pub}/d/{link['token']}") as resp:
+            page = await resp.text()
+        self.assertEqual(page.count('<button class="btn"'), 1)
+        self.assertIn(f'action="/d/{link["token"]}/2"', page)
+        self.assertNotIn(f'action="/d/{link["token"]}/0"', page)
+        self.assertNotIn(f'action="/d/{link["token"]}/1"', page)
+        self.assertIn("Agotado", page)
+        self.assertIn("No disponible", page)
 
     async def test_title_y_descripcion_no_filtran_el_nombre(self):
         nombre = "cliente-confidencial-2027"
@@ -168,7 +222,7 @@ class PaginasHttpTests(GatewayCase):
         revocado = await self.create_link()
         loc = await self.open_session(agotado)
         await self.fetch(loc)
-        await self.api("DELETE", f"/v1/links/{revocado['id']}?keep_file=1")
+        await self.api("DELETE", f"/v2/links/{revocado['id']}?keep_file=1")
         self.clock.advance(61)
         esperados = [(link, "Este enlace ya expiró"), (agotado, "Este enlace ya se usó"),
                      (revocado, "Este enlace fue revocado")]

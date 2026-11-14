@@ -24,6 +24,10 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(c.telegram_api_base)
         self.assertEqual(c.runner_path, "/app/runner/runner.sh")
 
+    def test_gitlab_fetch_default_and_override(self):
+        self.assertEqual(load_config(dict(BASE)).gitlab_fetch, "/app/gitlab/fetch.py")
+        self.assertEqual(load_config({**BASE, "BOT_GITLAB_FETCH": " /x/fetch.py "}).gitlab_fetch, "/x/fetch.py")
+
     def test_missing_required(self):
         for name in ("BOT_TOKEN_FILE", "BOT_ALLOWED_USER_IDS", "BOT_GATEWAY_URL", "BOT_GATEWAY_TOKEN_FILE"):
             env = dict(BASE)

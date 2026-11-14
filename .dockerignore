@@ -16,5 +16,7 @@ services/runner/tests
 services/runner/evals
 services/bot/tests
 services/bot/evals
+services/gitlab/tests
+services/gitlab/evals
 **/__pycache__
 **/*.pyc

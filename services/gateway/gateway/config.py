@@ -30,15 +30,16 @@ class Config:
     miss_limit: int = 20
     miss_window: float = 60.0
     block_seconds: int = 300
-    max_streams: int = 4
+    max_streams: int = 6
     limiter_max_ips: int = 10000
-    write_timeout: float = 20.0
+    write_timeout: float = 10.0
     max_streams_per_link: int = 2
     min_rate_bytes: int = 32768
-    min_rate_after: float = 30.0
+    min_rate_after: float = 15.0
     max_stream_seconds: int = 7200
     audit_max_mb: float = 50.0
     audit_keep: int = 5
+    stale_part_seconds: int = 7200
 
 
 def _number(env, name, default, kind, lo, hi):
@@ -80,7 +81,7 @@ def from_env(env=None):
         post_download_grace=_number(env, "GATEWAY_POST_DOWNLOAD_GRACE_SECONDS", 900, int, 0, 7200),
         miss_limit=_number(env, "GATEWAY_MISS_LIMIT", 20, int, 1, 100000),
         block_seconds=_number(env, "GATEWAY_BLOCK_SECONDS", 300, int, 1, 86400),
-        max_streams=_number(env, "GATEWAY_MAX_STREAMS", 4, int, 1, 1000),
+        max_streams=_number(env, "GATEWAY_MAX_STREAMS", 6, int, 1, 1000),
         max_streams_per_link=_number(env, "GATEWAY_MAX_STREAMS_PER_LINK", 2, int, 1, 1000),
         min_rate_bytes=_number(env, "GATEWAY_MIN_RATE_BYTES", 32768, int, 0, 10 ** 9),
         max_stream_seconds=_number(env, "GATEWAY_MAX_STREAM_SECONDS", 7200, int, 1, 604800),

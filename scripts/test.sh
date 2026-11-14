@@ -42,6 +42,7 @@ fi
 run_suite runner bash services/runner/tests/run.sh
 run_suite gateway bash -c "cd services/gateway && '$PY' -m unittest discover -s tests -t ."
 run_suite bot bash -c "cd services/bot && '$PY' -m unittest discover -s tests -t ."
+run_suite gitlab bash -c "cd services/gitlab && '$PY' -m unittest discover -s tests -t ."
 run_suite integracion "$PY" integration/e2e_stack.py
 run_suite deploy bash scripts/tests/test_deploy.sh
 if command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then

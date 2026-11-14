@@ -31,7 +31,8 @@ REQ = DumpRequest(42, HOSTILE, "c", HOSTILE, 3600, 2)
 URL = "https://d.test/d/abc_DEF-123?a=1&b=<2>"
 DUMP = {"db": HOSTILE, "server": HOSTILE, "container": "c", "filename": "f.sql.gz", "size_bytes": 5 * 1024 ** 2,
         "sha256": "ab" * 32, "duration_s": 75}
-LINK = {"id": "0123456789ab", "url": URL, "expires_at": "2099-01-01T00:00:00Z", "max_downloads": 2}
+LINK = {"id": "0123456789ab", "url": URL, "expires_at": "2099-01-01T00:00:00Z", "max_downloads": 2,
+        "files": [{"index": 0, "filename": "f.sql.gz", "kind": "db", "size_bytes": 1, "downloads_completed": 0}]}
 
 
 class Sink:
@@ -230,7 +231,7 @@ class DeliveryFailureTests(unittest.IsolatedAsyncioTestCase):
     async def test_send_failure_keeps_progress_short_and_without_link(self):
         sink = Sink(fail_send=True)
         with self.assertLogs("bot.notify", "WARNING"):
-            out = await report_job(StubJobs(Outcome("ok", "j", DUMP, LINK)), REQ, "j", sink)
+            out = await report_job(StubJobs(Outcome("ok", "j", DUMP, LINK)), REQ, "j", sink, delays=(0, 0))
         self.assertEqual(out.kind, "ok")
         final = sink.of("edit")[-1]
         self.assertNotIn("http", final[1])
@@ -244,7 +245,7 @@ class DeliveryFailureTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(logging.getLogger().handlers.clear)
         err = RuntimeError(f"POST https://api.telegram.org/bot{BOT_TOKEN}/sendMessage bloqueado Bearer {TOKEN}")
         sink = Sink(fail_send=True, fail_edit=True, error=err)
-        out = await report_job(StubJobs(Outcome("ok", "j", DUMP, LINK)), REQ, "j", sink)
+        out = await report_job(StubJobs(Outcome("ok", "j", DUMP, LINK)), REQ, "j", sink, delays=(0, 0))
         self.assertEqual(out.kind, "ok")
         log = stream.getvalue()
         self.assertIn("No se pudo enviar el aviso final", log)
@@ -262,7 +263,7 @@ class BackgroundJobTests(unittest.IsolatedAsyncioTestCase):
             audit_path = os.path.join(tmp, "audit.jsonl")
             jm = JobManager(RunnerClient(FAKE, timeout=5, env={"FAKE_MODE": "ok"}), gateway, Audit(audit_path, Redactor()), 1)
             sink = Sink(fail_send=True, fail_edit=True)
-            task = jm.spawn(report_job(jm, DumpRequest(42, "alpha", "c", "appdb", 3600, 1), "tg1-aaaa1111", sink))
+            task = jm.spawn(report_job(jm, DumpRequest(42, "alpha", "c", "appdb", 3600, 1), "tg1-aaaa1111", sink, delays=(0, 0)))
             await asyncio.wait_for(asyncio.shield(task), 5)
             await gateway.close()
             await server.close()

@@ -9,6 +9,7 @@ import re
 MASK = "***"
 _BOT_URL = re.compile(r"/(file/)?bot[^/\s'\"<>]+")
 _BEARER = re.compile(r"(?i)(bearer\s+)[^\s'\"]+")
+_GITLAB_TOKEN = re.compile(r"\b(?:glpat|gldt|glptt|glrt|glcbt|glimt|glsoat|glffct|glagent|gloas)-[\w-]+")
 _TOKEN_SHAPE = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b")
 
 
@@ -28,6 +29,7 @@ class Redactor:
             text = text.replace(s, MASK)
         text = _BOT_URL.sub(lambda m: "/" + (m.group(1) or "") + "bot" + MASK, text)
         text = _BEARER.sub(lambda m: m.group(1) + MASK, text)
+        text = _GITLAB_TOKEN.sub(MASK, text)
         return _TOKEN_SHAPE.sub(MASK, text)
 
 

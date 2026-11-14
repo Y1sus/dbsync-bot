@@ -20,7 +20,7 @@ fi
 chmod 600 secrets/gateway_token secrets/known_hosts .env
 
 missing=0
-for f in secrets/telegram_token secrets/ssh/dbsync_bot_ed25519; do
+for f in secrets/telegram_token secrets/ssh/dbsync_bot_ed25519 secrets/gitlab_token projects.json; do
     [[ -s "$f" ]] || { echo "FALTA $f" >&2; missing=1; }
 done
 exit $missing

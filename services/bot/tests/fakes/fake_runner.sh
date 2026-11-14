@@ -3,9 +3,10 @@
 # services/bot/tests/fakes/fake_runner.sh — Runner falso que imita el contrato, guiado por FAKE_MODE
 # Autor: Jesús Montalvo <jmontalvo_m@outlook.com>
 # =============================================================================
-# FAKE_MODE: ok | err | usage | empty | garbage | hang | badjson | slow
+# FAKE_MODE: ok | flood_out | flood_err | trickle | err | usage | empty | garbage | hang | badjson | slow
 # FAKE_MODE_FILE: si existe, su contenido reemplaza a FAKE_MODE (permite cambiar el modo en caliente)
 # FAKE_ARGS_FILE: si existe, registra los argumentos recibidos
+# FAKE_TS_FILE: registra inicio y fin del dump (para comprobar paralelismo)
 # FAKE_PID_FILE: en modo hang, escribe aquí el pid del hijo (como ssh)
 set -u
 [[ -n "${FAKE_ARGS_FILE:-}" ]] && printf '%s\n' "$*" >> "$FAKE_ARGS_FILE"
@@ -14,8 +15,17 @@ declare -A a=()
 while [[ $# -gt 1 ]]; do a["${1#--}"]="$2"; shift 2; done
 SHA=$(printf 'a%.0s' {1..64})
 mode="${FAKE_MODE:-ok}"
+stamp() { [[ -n "${FAKE_TS_FILE:-}" && "$cmd" == "dump" ]] && echo "runner $1 $(date +%s.%N)" >> "$FAKE_TS_FILE"; return 0; }
+stamp start
 [[ -n "${FAKE_MODE_FILE:-}" && -f "$FAKE_MODE_FILE" ]] && mode="$(<"$FAKE_MODE_FILE")"
 case "$mode" in
+  flood_out|flood_err)
+    sleep 300 &
+    [[ -n "${FAKE_PID_FILE:-}" ]] && echo $! > "$FAKE_PID_FILE"
+    if [[ "$mode" == flood_out ]]; then head -c 3000000 /dev/zero | tr '\0' 'x'; else head -c 3000000 /dev/zero | tr '\0' 'x' >&2; fi
+    wait ;;
+  trickle)
+    for _ in 1 2 3 4; do head -c 30000 /dev/zero | tr '\0' 'e' >&2; sleep 0.01; done ;;
   empty) exit 1 ;;
   garbage) echo "esto no es json"; exit 0 ;;
   badjson) echo '{"schema_version":1,"ok":true,"command":"dump","job_id":"x"}'; exit 0 ;;
@@ -30,6 +40,7 @@ case "$mode" in
     wait ;;
   slow) sleep "${FAKE_SLEEP:-0.3}" ;;
 esac
+stamp end
 case "$cmd" in
   servers) echo '{"schema_version":1,"ok":true,"command":"servers","servers":[{"name":"alpha","host":"10.0.0.1","access_mode":"docker"},{"name":"beta","host":"10.0.0.2","access_mode":"native"}]}' ;;
   containers) echo '{"schema_version":1,"ok":true,"command":"containers","server":"'"${a[server]:-}"'","containers":[{"name":"mysql8","engine":"mysql","image":"mysql:8","db_count":2},{"name":"pg","engine":"postgresql","image":"postgres:16","db_count":null,"list_error":"x"}]}' ;;

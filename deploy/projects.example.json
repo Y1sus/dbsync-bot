@@ -10,84 +10,48 @@
       }
     },
     {
-      "name": "mcallen",
-      "path": "desarrollo_lionsystems/mcallen",
+      "name": "fivaro",
+      "path": "erps6914234/fivaro",
       "db": {
         "server": "devlion",
-        "container": "mcallen-mysql",
-        "db": "mcallen_develop"
+        "container": "mysql-general",
+        "db": "fivaro_develop"
       }
     },
     {
-      "name": "everest",
-      "path": "desarrollo_lionsystems/everest",
+      "name": "opli",
+      "path": "erps6914234/opli",
       "db": {
-        "server": "devimed",
-        "container": "mysql8",
-        "db": "everest_develop"
+        "server": "devlion",
+        "container": "mysql-general",
+        "db": "opli_develop"
       }
     },
     {
-      "name": "quesos-lucy",
-      "path": "desarrollo_lionsystems/quesos-lucy",
+      "name": "cezac",
+      "path": "erps6914234/cezac",
       "db": {
-        "server": "devimed",
-        "container": "mysql8",
-        "db": "quesoslucy_develop"
+        "server": "devlion",
+        "container": "mysql-general",
+        "db": "cezac_develop"
       }
     },
     {
-      "name": "quesos-arturo",
-      "path": "erps6914234/quesos-arturo",
+      "name": "labarata",
+      "path": "desarrollo_lionsystems/labarata",
       "db": {
-        "server": "devimed",
-        "container": "mysql8",
-        "db": "quesosarturo_develop"
+        "server": "devlion",
+        "container": "mysql-5",
+        "db": "labarata_develop"
       }
     },
     {
-      "name": "ecommerce-ba",
-      "path": "desarrollo_lionsystems/ecommerce-ba",
+      "name": "erplion",
+      "path": "desarrollo_lionsystems/erplion",
       "db": {
-        "server": "devimed",
-        "container": "mysql8",
-        "db": "ecommerce_ba"
-      }
-    },
-    {
-      "name": "core-ba",
-      "path": "desarrollo_lionsystems/core-ba",
-      "db": {
-        "server": "devimed",
-        "container": "mysql8",
-        "db": "core_ba"
-      }
-    },
-    {
-      "name": "cotizador-graficas",
-      "path": "desarrollo_lionsystems/especialidades-graficas-cotizador",
-      "db": {
-        "server": "devimed",
-        "container": "mysql8",
-        "db": "especialidadesgraficas_develop"
-      }
-    },
-    {
-      "name": "puntoventa-lion",
-      "path": "desarrollo_lionsystems/puntoventa-lion-erp",
-      "db": {
-        "server": "devimed",
-        "container": "mysql8",
-        "db": "puntoventalion_develop"
-      }
-    },
-    {
-      "name": "ima",
-      "path": "desarrollo_lionsystems/ima",
-      "db": {
-        "server": "devimed",
-        "container": "mysql8",
-        "db": "ima_develop"
+        "server": "devlion",
+        "container": "mysql-general",
+        "db": "erplion_develop"
       }
     },
     {

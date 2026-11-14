@@ -38,6 +38,10 @@ class FakeTelegram:
     def calls_of(self, method):
         return [c for c in self.calls if c["method"] == method]
 
+    def order(self, *methods):
+        """Índices (orden de llegada) de las llamadas a `methods`, para verificar secuencias."""
+        return [i for i, c in enumerate(self.calls) if c["method"] in methods]
+
     async def push(self, **payload):
         async with self._cond:
             self._next_update += 1
@@ -88,6 +92,7 @@ class FakeTelegram:
         elif method == "sendMessage":
             result = self._message(params["chat_id"], params.get("text", ""))
             self._store(result, params)
+            self.calls[-1]["message_id"] = result["message_id"]
         elif method == "editMessageText":
             key = (int(params["chat_id"]), int(params["message_id"]))
             result = {**self.messages.get(key, self._message(params["chat_id"], "")), "text": params.get("text", "")}
@@ -97,6 +102,12 @@ class FakeTelegram:
 
     def _store(self, msg, params):
         markup = json.loads(params["reply_markup"]) if params.get("reply_markup") else None
+        for row in (markup or {}).get("inline_keyboard", []):
+            for b in row:
+                kinds = [k for k in ("callback_data", "url", "copy_text") if k in b]
+                assert len(kinds) == 1, f"botón inválido: {b}"
+                if "copy_text" in b:
+                    assert 1 <= len(b["copy_text"]["text"]) <= 256, "copy_text fuera de 1-256"
         self.messages[(msg["chat"]["id"], msg["message_id"])] = {**msg, "markup": markup, "params": params}
 
     async def _get_updates(self, params):

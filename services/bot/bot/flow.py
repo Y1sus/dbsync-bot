@@ -19,6 +19,9 @@ TTL_CHOICES = (3600, 14400, 86400)
 MAX_CHOICES = (1, 3, 5)
 MAX_DOWNLOADS_LIMIT = 20
 STDERR_CHARS = 1500
+COPY_TEXT_MAX = 256
+PURGE_NOTE = "Al revocar o al vencer un enlace se elimina el dump."
+REVOKED_NOTE = "Enlace revocado; el dump se eliminará."
 
 NAME_RE = {
     "server": re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z"),
@@ -65,7 +68,8 @@ def esc(value) -> str:
 @dataclass(frozen=True)
 class Button:
     text: str
-    data: str
+    data: str = ""
+    copy_text: str | None = None
 
 
 @dataclass
@@ -77,6 +81,10 @@ class View:
 def _btn(text, data):
     assert len(data.encode()) <= 64
     return Button(str(text)[:60], data)
+
+
+def _copy_btn(text, value):
+    return Button(str(text)[:60], copy_text=value)
 
 
 def human_size(n) -> str:
@@ -402,9 +410,10 @@ def fmt_servers(servers) -> View:
     return View("Servidores:\n" + "\n".join(lines))
 
 
-def fmt_links(links, now=None, limit=10) -> View:
+def fmt_links(links, now=None, limit=10, notice="") -> View:
+    head = f"{notice}\n\n" if notice else ""
     if not links:
-        return View("No hay enlaces activos.")
+        return View(head + "No hay enlaces activos.")
     lines, kb = [], []
     for rec in links[:limit]:
         lines.append(
@@ -414,7 +423,7 @@ def fmt_links(links, now=None, limit=10) -> View:
         )
         kb.append([_btn(f"Revocar {rec['id']}", f"r|{rec['id']}")])
     extra = f"\ny {len(links) - limit} más." if len(links) > limit else ""
-    return View("Enlaces activos:\n" + "\n".join(lines) + extra, kb)
+    return View(head + "Enlaces activos:\n" + "\n".join(lines) + extra + f"\n\n{PURGE_NOTE}", kb)
 
 
 def fmt_status(running, waiting, now=None) -> View:
@@ -444,6 +453,11 @@ def _tail(text, limit=STDERR_CHARS):
 def fmt_failure(code, message, stderr, what="el dump") -> str:
     base = ERROR_MESSAGES.get(code, "Error desconocido.")
     text = f"Falló {what} ({esc(code)}).\n{esc(base)}"
+    return text + _failure_detail(code, message, stderr)
+
+
+def _failure_detail(code, message, stderr) -> str:
+    text = ""
     if message and code in ("E_TIMEOUT", "E_BAD_OUTPUT", "E_RUNNER_START"):
         text += f"\n{esc(message)}"
     tail = _tail(stderr)
@@ -452,18 +466,60 @@ def fmt_failure(code, message, stderr, what="el dump") -> str:
     return text
 
 
-def fmt_success(outcome, req, now=None) -> str:
+def _target(d) -> str:
+    return f"{esc(d['server'])}/{esc(d['db'])}"
+
+
+def _req_target(req) -> str:
+    return f"{esc(req.server)}/{esc(req.db)}"
+
+
+def fmt_job_success(outcome, req, now=None) -> View:
+    """Aviso final de éxito: primer renglón de resumen y enlace solo dentro de <code>."""
     d, link = outcome.dump, outcome.link
-    return (
-        f"Dump listo: <b>{esc(d['db'])}</b> ({esc(d['server'])}/{esc(d['container'])})\n"
+    url = str(link["url"])
+    text = (
+        f"✅ Dump listo · {_target(d)} · {human_size(d['size_bytes'])}\n"
         f"Archivo: <code>{esc(d['filename'])}</code>\n"
-        f"Tamaño: {human_size(d['size_bytes'])}\n"
         f"sha256: <code>{esc(d['sha256'][:12])}…</code>\n"
         f"Duración: {fmt_elapsed(d['duration_s'])}\n"
-        f"Expira: {fmt_expiry(link.get('expires_at'), now)}\n"
-        f"Descargas máximas: {esc(link.get('max_downloads', req.max_downloads))}\n"
-        f"{esc(link['url'])}"
+        f"Vence: {fmt_expiry(link.get('expires_at'), now)} o tras "
+        f"{esc(link.get('max_downloads', req.max_downloads))} descarga(s)\n"
+        f"Enlace (tócalo para copiarlo):\n<code>{esc(url)}</code>"
     )
+    kb = []
+    if len(url) <= COPY_TEXT_MAX:
+        kb.append([_copy_btn("📋 Copiar enlace", url)])
+    kb.append([_btn("Revocar enlace", f"r|{link['id']}")])
+    return View(text, kb)
+
+
+def fmt_job_failure(outcome, req) -> View:
+    base = ERROR_MESSAGES.get(outcome.code, "Error desconocido.")
+    text = f"❌ Dump falló · {esc(outcome.code)}\n{_req_target(req)}\n{esc(base)}"
+    return View(text + _failure_detail(outcome.code, outcome.message, outcome.stderr))
+
+
+def fmt_job_link_failure(outcome) -> View:
+    d = outcome.dump
+    return View(f"⚠️ Dump listo, pero el enlace falló · {_target(d)} · {human_size(d['size_bytes'])}\n"
+                + fmt_link_failure(outcome))
+
+
+def fmt_job_cancelled(req) -> View:
+    return View(f"❌ Dump falló · E_CANCELLED\n{_req_target(req)}\nEl dump se canceló porque el bot se reinició.")
+
+
+def fmt_progress_done(kind, req, notified=True) -> str:
+    """Estado final corto del mensaje de progreso (sin enlace ni detalle)."""
+    icon = {"ok": "✅ Dump terminado", "link_failed": "⚠️ Dump terminado sin enlace",
+            "cancelled": "🚫 Dump cancelado"}.get(kind, "❌ Dump falló")
+    tail = " El detalle está en el mensaje siguiente." if notified else ""
+    return f"{icon}: {_req_target(req)}.{tail}"
+
+
+def fmt_revoked(link_id) -> str:
+    return f"Enlace <code>{esc(link_id)}</code> revocado; el dump se eliminará."
 
 
 def fmt_link_failure(outcome) -> str:

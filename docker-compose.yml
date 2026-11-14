@@ -28,6 +28,8 @@ services:
     mem_limit: 128m
     cpus: 0.5
     pids_limit: 100
+    ulimits:
+      nofile: { soft: 1024, hard: 2048 }
     environment:
       GATEWAY_PUBLIC_BASE_URL: "${GATEWAY_PUBLIC_BASE_URL:?Define GATEWAY_PUBLIC_BASE_URL en .env}"
       GATEWAY_DUMPS_ROOT: /dumps

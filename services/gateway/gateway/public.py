@@ -1,16 +1,17 @@
 # =============================================================================
-# services/gateway/gateway/public.py — Listener público: página intermedia, sesiones y descarga
+# services/gateway/gateway/public.py — Listener público: páginas, sesiones, descarga y endurecimiento
 # Autor: Jesús Montalvo <jmontalvo_m@outlook.com>
 # =============================================================================
 
-import html
 import logging
 import os
+import re
+from urllib.parse import urlsplit
 
 from aiohttp import web
 
 from .context import Context
-from . import paths, tokens
+from . import pages, paths, tokens
 from .audit import client_info, iso_utc
 from .ranges import RangeNotSatisfiable, parse_range
 from .streaming import send
@@ -24,49 +25,71 @@ SECURITY_HEADERS = {
     "X-Robots-Tag": "noindex",
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
-    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
+    "Content-Security-Policy": pages.CSP,
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Server": "gateway",
 }
-
-GONE_MESSAGES = {
-    "expired": "Este enlace expiró.",
-    "exhausted": "Este enlace ya alcanzó su límite de descargas.",
-    "revoked": "Este enlace fue revocado.",
-    "session": "La sesión de descarga expiró. Abre de nuevo el enlace si sigue vigente.",
-    "file": "El archivo ya no está disponible.",
-}
-
-_STYLE = (
-    "body{font-family:system-ui,sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem;color:#222}"
-    "dl{display:grid;grid-template-columns:auto 1fr;gap:.4rem 1rem}dt{font-weight:600}"
-    "dd{margin:0;word-break:break-all}button{font-size:1rem;padding:.6rem 1.4rem;margin-top:1rem}"
-)
+HSTS = "max-age=31536000"
 
 
-def _page(status, title, body_html):
-    doc = (
-        '<!doctype html><html lang="es"><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        '<meta name="robots" content="noindex">'
-        f"<title>{html.escape(title)}</title><style>{_STYLE}</style></head>"
-        f"<body><main><h1>{html.escape(title)}</h1>{body_html}</main></body></html>"
-    )
-    return web.Response(status=status, text=doc, content_type="text/html", charset="utf-8")
+def _page(kind, status=None, headers=None, **kwargs):
+    code, doc = pages.render(kind, **kwargs)
+    return web.Response(status=status or code, text=doc, content_type="text/html", charset="utf-8",
+                        headers=headers)
 
 
 def _not_found():
-    return _page(404, "Enlace no encontrado", "<p>El enlace no existe o es incorrecto.</p>")
+    return _page("notfound")
 
 
 def _gone(reason):
-    return _page(410, "Enlace no disponible", f"<p>{html.escape(GONE_MESSAGES[reason])}</p>")
+    return _page(reason)
 
 
-def _human_size(size):
-    value = float(size)
-    for unit in ("B", "KiB", "MiB", "GiB"):
-        if value < 1024 or unit == "GiB":
-            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
-        value /= 1024
+ORIGIN_RE = re.compile(r"^(https?)://([a-z0-9.-]+|\[[0-9a-f:]+\])(?::([0-9]{1,5}))?$", re.I)
+DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _normalize(origin):
+    """(esquema, host, puerto) de un Origin estricto (sin ruta, usuario, barras invertidas ni espacios)."""
+    match = ORIGIN_RE.match(origin)
+    if match is None:
+        return None
+    scheme = match.group(1).lower()
+    port = int(match.group(3)) if match.group(3) else DEFAULT_PORTS[scheme]
+    return scheme, match.group(2).lower(), port
+
+
+def _base_origin(url):
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    try:
+        port = parts.port or DEFAULT_PORTS.get(scheme)
+    except ValueError:
+        return None
+    return scheme, (parts.hostname or "").lower(), port
+
+
+def origin_violation(headers, base_url):
+    """Regla del contrato para POST. Devuelve el motivo del rechazo o None si se acepta."""
+    site = headers.get("Sec-Fetch-Site")
+    if site is not None and site not in ("same-origin", "none"):
+        return f"sec-fetch-site={site[:40]}"
+    origin = headers.get("Origin")
+    if origin is not None and origin != "null":
+        parsed = _normalize(origin)
+        if parsed is None:
+            return "origin=invalido"
+        if parsed != _base_origin(base_url):
+            return f"origin={parsed[1][:100]}"
+    return None
+
+
+def _expires_text(epoch):
+    stamp = iso_utc(epoch)
+    return f"{stamp[:10]} {stamp[11:16]} UTC"
 
 
 async def _lookup(ctx, token):
@@ -89,32 +112,52 @@ async def landing(request):
         return web.Response(status=200, content_type="text/html", charset="utf-8")
     ip, ua = client_info(request)
     ctx.audit.log("landing_view", link["id"], ip, ua)
-    rows = [
-        ("Archivo", link["filename"]),
-        ("Tamaño", _human_size(link["size_bytes"])),
-        ("SHA-256", link["sha256"] or "no disponible"),
-        ("Expira", iso_utc(link["expires_at"]) + " (UTC)"),
-        ("Descargas restantes", str(link["max_downloads"] - link["downloads_completed"])),
-    ]
-    items = "".join(f"<dt>{html.escape(k)}</dt><dd>{html.escape(v)}</dd>" for k, v in rows)
-    body = f'<dl>{items}</dl><form method="post"><button type="submit">Descargar</button></form>'
-    return _page(200, "Descarga de respaldo", body)
+    now = ctx.now()
+    status, doc = pages.landing(
+        link["filename"], link["size_bytes"], link["sha256"],
+        _expires_text(link["expires_at"]),
+        link["expires_at"] - now, link["max_downloads"] - link["downloads_completed"],
+    )
+    return web.Response(status=status, text=doc, content_type="text/html", charset="utf-8")
 
 
 async def start_session(request):
     ctx = request.app[CTX]
+    reason = origin_violation(request.headers, ctx.config.public_base_url)
+    if reason:
+        ip, ua = client_info(request)
+        ctx.audit.log("origin_rejected", None, ip, ua, reason=reason)
+        return _page("forbidden")
     token = request.match_info["token"]
     link = await _lookup(ctx, token)
     if link is None:
         return _not_found()
     status, session_id = await ctx.db(
-        ctx.store.open_or_reuse_session, link["id"], ctx.now(), ctx.config.session_ttl
+        ctx.store.open_or_reuse_session, link["id"], ctx.now(), ctx.config.session_ttl,
+        ctx.config.post_download_grace
     )
     if status == "not_found":
         return _not_found()
     if status != "ok":
         return _gone(status)
     return web.Response(status=303, headers={"Location": f"/d/{token}/f/{session_id}"})
+
+
+def _claim(ctx, link, session_id, stream):
+    """Valida la sesión y reserva el stream bajo el candado de borrado (cierra la carrera con la limpieza)."""
+    with ctx.store.locked():
+        session = ctx.store.get_session(session_id, link["id"])
+        if session is None:
+            current = ctx.store.get_link(link["id"], ctx.now())
+            return "revoked" if current and current["state"] == "revoked" else "notfound"
+        if session["expires_at"] <= ctx.now():
+            return "session"
+        if stream:
+            cfg = ctx.config
+            if ctx.active.total >= cfg.max_streams or ctx.active.count(link["id"]) >= cfg.max_streams_per_link:
+                return "busy"
+            ctx.active.enter(link["id"])
+    return "ok"
 
 
 async def download(request):
@@ -125,47 +168,74 @@ async def download(request):
         return _not_found()
     if link["state"] == "revoked":
         return _gone("revoked")
-    session = await ctx.db(ctx.store.get_session, session_id, link["id"])
-    if session is None:
+    stream = request.method != "HEAD"
+    verdict = await ctx.db(_claim, ctx, link, session_id, stream)
+    if verdict == "notfound":
         return _not_found()
-    if session["expires_at"] <= ctx.now():
-        return _gone("session")
-    try:
-        fd, size = await ctx.db(paths.open_dump, ctx.config.dumps_root, link["relpath"])
-    except paths.PathError:
-        return _gone("file")
+    if verdict in ("session", "revoked"):
+        return _gone(verdict)
+    if verdict == "busy":
+        return _page("busy", headers={"Retry-After": "30"})
     try:
         try:
-            rng = parse_range(request.headers.get("Range"), size)
-        except RangeNotSatisfiable:
-            return web.Response(status=416, headers={"Content-Range": f"bytes */{size}"})
-        return await send(request, ctx, link, session_id, fd, size, rng)
+            fd, size = await ctx.db(paths.open_dump, ctx.config.dumps_root, link["relpath"])
+        except paths.PathError:
+            return _gone("file")
+        try:
+            try:
+                rng = parse_range(request.headers.get("Range"), size)
+            except RangeNotSatisfiable:
+                return web.Response(status=416, headers={"Content-Range": f"bytes */{size}"})
+            if stream:
+                start, end = rng if rng else (0, size - 1)
+                reserved = await ctx.db(ctx.store.reserve_bytes, session_id, end - start + 1, size, ctx.now())
+                if reserved != "ok":
+                    return _gone("budget" if reserved == "budget" else "session")
+            return await send(request, ctx, link, session_id, fd, size, rng)
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        if stream:
+            ctx.active.exit(link["id"])
+            if not ctx.active.busy(link["id"]):
+                ctx.revoked.discard(link["id"])
 
 
 @web.middleware
-async def errors(request, handler):
+async def guard(request, handler):
+    """Limitador de 404 por IP y página de error uniforme para cualquier excepción."""
+    ctx = request.app[CTX]
+    ip, ua = client_info(request)
+    wait = ctx.limiter.blocked(ip)
+    if wait:
+        return _page("limited", headers={"Retry-After": str(wait)}, retry_after=wait)
     try:
-        return await handler(request)
+        response = await handler(request)
     except web.HTTPException as exc:
         if exc.status == 404:
-            return _not_found()
-        if exc.status == 405:
-            return _page(405, "Método no permitido", "<p>Esta ruta no admite ese método.</p>")
-        return _page(exc.status, "Solicitud no válida", "<p>No se pudo procesar la solicitud.</p>")
+            response = _not_found()
+        elif exc.status == 405:
+            allow = exc.headers.get("Allow")
+            response = _page("method", headers={"Allow": allow} if allow else None)
+        else:
+            response = _page("bad", status=exc.status if 400 <= exc.status < 600 else 400)
     except Exception:
         log.exception("Error interno en el listener público")
-        return _page(500, "Error interno", "<p>Ocurrió un error. Intenta más tarde.</p>")
+        response = _page("error")
+    if response.status == 404 and ctx.limiter.miss(ip):
+        ctx.audit.log("rate_limited", None, ip, ua, block_seconds=ctx.config.block_seconds)
+    return response
 
 
 async def _add_headers(request, response):
     for name, value in SECURITY_HEADERS.items():
         response.headers[name] = value
+    if request.headers.get("X-Forwarded-Proto", "").strip().lower() == "https":
+        response.headers["Strict-Transport-Security"] = HSTS
 
 
 def create_app(ctx):
-    app = web.Application(middlewares=[errors], client_max_size=1024)
+    app = web.Application(middlewares=[guard], client_max_size=1024)
     app[CTX] = ctx
     app.on_response_prepare.append(_add_headers)
     tok = r"{token:[A-Za-z0-9_-]{43}}"

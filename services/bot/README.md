@@ -16,8 +16,8 @@ y responde con la URL. Solo atiende a los ids de `BOT_ALLOWED_USER_IDS`.
 | `/servers` | servidores configurados |
 | `/dump` | asistente con botones: servidor, contenedor, base, confirmación (TTL 1/4/24 h, descargas 1/3/5) |
 | `/dump <servidor> <contenedor> <db> [ttl=2h] [max=3]` | forma directa (`ttl` de 60s a 7d, `max` de 1 a 20) |
-| `/links` | enlaces activos, con botón para revocar |
-| `/revoke <id>` | revoca un enlace |
+| `/links` | enlaces activos, con botón para revocar; revocar o vencer elimina el dump |
+| `/revoke <id>` | revoca el enlace y el gateway borra el dump (`DELETE /v1/links/{id}` sin `keep_file`) |
 | `/status` | job en curso o libre |
 
 El estado del asistente vive en memoria con un id de 8 hex (el `callback_data` de
@@ -58,6 +58,22 @@ mensaje claro, sin traceback.
   (`os.killpg`) para cosechar ssh. Valida `job-result.schema.json` a mano.
   Códigos locales extra: `E_TIMEOUT`, `E_BAD_OUTPUT`, `E_RUNNER_START`, `E_CANCELLED`.
 - Si el dump existe pero el enlace falla, el mensaje lo dice.
+- Enlace que se copia, no se abre: la URL va solo dentro de `<code>` (tocar monoespaciado
+  copia) y un botón `copy_text` ("📋 Copiar enlace", máx. 256 caracteres; si la URL es más
+  larga se omite el botón). Nunca botones `url` ni la URL como texto plano ni en otro mensaje.
+  `flow.Button` lleva `copy_text` como dato; `handlers._button` lo traduce a `CopyTextButton`.
+- Aviso al terminar (`notify.py`, sin aiogram): editar no genera push, así que el resultado
+  (éxito, fallo del runner, timeout, cancelación, enlace fallido) sale como mensaje NUEVO con
+  `disable_notification=False` y primer renglón de resumen ("✅ Dump listo · servidor/base ·
+  tamaño" o "❌ Dump falló · código"). El mensaje "Generando dump…" se edita a un estado
+  final corto sin enlace. La cola y el inicio de un job en cola siguen siendo ediciones.
+  El job corre en una tarea de fondo (`JobManager.spawn`): sigue aunque el usuario salga del
+  chat. Si el aviso nuevo falla (red, bot bloqueado) se registra solo el tipo de error, el
+  progreso igual se cierra corto y el job no se rompe. El enlace no se reenvía por otra vía
+  (`/links` no muestra la URL): hay que relanzar `/dump`.
+- Revocar (botón o `/revoke`) no pasa `keep_file`: el gateway borra el dump. El texto dice
+  "Enlace revocado; el dump se eliminará" porque una sesión abierta o una descarga en curso
+  pueden retrasar el borrado unos minutos.
 - Seguridad de logs: `redact.py` (filtro en el handler raíz) enmascara el token del bot
   (`/bot<token>/`), el del gateway y cualquier `Bearer`, también en tracebacks.
 - Auditoría: `BOT_DATA_DIR/audit.jsonl` (0600) con `command`, `job_start`, `job_end`,
@@ -70,7 +86,7 @@ mensaje claro, sin traceback.
 ```bash
 cd services/bot
 PY=../../.venv/bin/python
-$PY -m unittest discover -s tests -t .     # puerta: offline, sin aiogram, < 2 s
+$PY -m unittest discover -s tests -t .     # puerta: offline, sin aiogram, ~1.5 s
 $PY evals/e2e_bot.py                        # eval e2e: bot real vs Telegram, gateway y runner falsos
 ```
 

@@ -23,6 +23,7 @@ class FakeGateway:
         self.token = token
         self.links = {}
         self.requests = []
+        self.deleted_files = set()
         self.mode = "ok"  # ok | error500 | slow
         self.existing_files = existing_files  # None = todos existen
         self.app = web.Application(middlewares=[self._mw])
@@ -36,7 +37,7 @@ class FakeGateway:
         body = None
         if request.can_read_body and request.content_type == "application/json":
             body = await request.json()
-        self.requests.append({"method": request.method, "path": request.path, "auth": request.headers.get("Authorization"), "body": body})
+        self.requests.append({"method": request.method, "path": request.path, "query": dict(request.query), "auth": request.headers.get("Authorization"), "body": body})
         if request.headers.get("Authorization") != f"Bearer {self.token}":
             return _err(401, "unauthorized", "token inválido")
         if self.mode == "error500":
@@ -85,6 +86,8 @@ class FakeGateway:
         if rec is None:
             return _err(404, "not_found", "no existe")
         rec["state"] = "revoked"
+        if request.query.get("keep_file") != "1":
+            self.deleted_files.add(rec["relpath"])
         return web.Response(status=204)
 
     async def health(self, request):

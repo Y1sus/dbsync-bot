@@ -2,7 +2,8 @@
 # integration/e2e_stack.py — Eval de integración runner -> bot -> gateway real
 # Corre el runner real (ssh/docker simulados), el JobManager del bot y el
 # gateway real como proceso, y recorre el ciclo completo de un enlace.
-# Umbral de aprobación: 100 % de comprobaciones.
+# Umbral de aprobación: 100 % de comprobaciones. Con --full agrega el borrado
+# automático (esperas de varios segundos); sin él corre en menos de 1 s.
 # Autor: Jesús Montalvo <jmontalvo_m@outlook.com>
 # =============================================================================
 
@@ -30,6 +31,7 @@ from bot.runner_client import RunnerClient  # noqa: E402
 SHIMS = os.path.join(ROOT, "services", "runner", "tests", "shims")
 RUNNER = os.path.join(ROOT, "services", "runner", "runner.sh")
 GATEWAY_TOKEN = "gw-token-de-prueba-0123456789abcdef"
+FULL = "--full" in sys.argv
 PASS = []
 FAIL = []
 
@@ -90,7 +92,8 @@ async def main():
         env={**os.environ, "GATEWAY_PUBLIC_BASE_URL": base, "GATEWAY_DUMPS_ROOT": os.path.join(tmp, "dumps"),
              "GATEWAY_DATA_DIR": os.path.join(tmp, "gw-data"), "GATEWAY_API_TOKEN_FILE": token_file,
              "GATEWAY_PUBLIC_PORT": str(pub), "GATEWAY_INTERNAL_PORT": str(internal),
-             "GATEWAY_BIND_HOST": "127.0.0.1", "GATEWAY_CLEANUP_INTERVAL_SECONDS": "1"})
+             "GATEWAY_BIND_HOST": "127.0.0.1", "GATEWAY_CLEANUP_INTERVAL_SECONDS": "1",
+             "GATEWAY_POST_DOWNLOAD_GRACE_SECONDS": "4"})
     gateway = GatewayClient(f"http://127.0.0.1:{internal}", GATEWAY_TOKEN)
     try:
         up = await wait_http(f"http://127.0.0.1:{internal}/v1/health", {"Authorization": f"Bearer {GATEWAY_TOKEN}"})
@@ -117,6 +120,7 @@ async def main():
         file_path = os.path.join(tmp, "dumps", dump["relpath"])
         check("el gateway resuelve el relpath del runner (mismo archivo)", os.path.isfile(file_path))
         check("sha256 del runner coincide con el archivo", sha(file_path) == dump["sha256"])
+        check("el dump del runner quedó 0600", oct(os.stat(file_path).st_mode & 0o777) == "0o600")
         check("el enlace usa la URL pública configurada", link["url"].startswith(base + "/d/"))
         size = dump["size_bytes"]
         check("el tamaño del enlace coincide con el dump", link["size_bytes"] == size)
@@ -152,27 +156,34 @@ async def main():
 
             print("== 4. descarga en dos rangos (el último primero)")
             half = size // 2
+            async with http.get(session_url, headers={"Range": "bytes=-1"}) as r:
+                await r.read()
+                check("sonda Range bytes=-1: 206", r.status == 206)
+            check("la sonda de 1 byte no cuenta como descarga",
+                  (await gateway.list_links("all"))[0]["downloads_completed"] == 0)
             async with http.get(session_url, headers={"Range": f"bytes={half}-"}) as r:
                 part2 = await r.read()
                 check("rango final: 206 con Content-Range", r.status == 206
                       and r.headers.get("Content-Range") == f"bytes {half}-{size - 1}/{size}")
             mid = (await gateway.list_links("all"))[0]
-            check("el último byte cuenta una vez, aunque falte el primer rango", mid["downloads_completed"] == 1)
+            check("con solo la mitad final la cobertura no está completa: aún no cuenta", mid["downloads_completed"] == 0)
             async with http.get(session_url, headers={"Range": f"bytes=0-{half - 1}"}) as r:
                 part1 = await r.read()
                 check("rango inicial: 206", r.status == 206)
             blob = part1 + part2
             check("el reensamblado coincide con sha256 del runner", hashlib.sha256(blob).hexdigest() == dump["sha256"])
             rec = (await gateway.list_links("all"))[0]
-            check("downloads_completed == 1 (no se duplica)", rec["downloads_completed"] == 1, rec)
+            check("al completarse la cobertura de bytes cuenta una sola vez", rec["downloads_completed"] == 1, rec)
             check("el enlace queda agotado", rec["state"] == "exhausted")
 
             print("== 5. la sesión sigue sirviendo; un POST nuevo no")
             async with http.get(session_url, headers={"Range": "bytes=0-9"}) as r:
                 check("reanudar rango en la misma sesión: 206", r.status == 206 and len(await r.read()) == 10)
-            async with http.get(session_url) as r:
-                check("descarga completa en la sesión abierta: 200", r.status == 200
-                      and hashlib.sha256(await r.read()).hexdigest() == dump["sha256"])
+            async with http.get(session_url, headers={"Range": "bytes=11-"}) as r:
+                rest = await r.read()
+                check("resto del archivo dentro del presupuesto (2 x tamaño): 206", r.status == 206 and len(rest) == size - 11)
+            async with http.get(session_url, headers={"Range": "bytes=0-0"}) as r:
+                check("presupuesto de la sesión agotado: 410", r.status == 410, r.status)
             rec = (await gateway.list_links("all"))[0]
             check("repetir en la sesión no suma", rec["downloads_completed"] == 1)
             async with http.post(landing, allow_redirects=False) as r:
@@ -212,6 +223,64 @@ async def main():
             async with http.post(f"{base}/d/{tok3}", allow_redirects=False) as r:
                 check("enlace revocado: 410", r.status == 410)
 
+
+            async def new_job(tag, max_dl=1):
+                o = await jobs.run(DumpRequest(user_id=506679030, server="gate", container="fakemysql", db="appdb",
+                                               ttl=3600, max_downloads=max_dl), f"tg-{tag}-abcd1234")
+                assert o.kind == "ok", o
+                return o, os.path.join(tmp, "dumps", o.dump["relpath"]), re.search(r"/d/([^/?#]+)$", o.link["url"]).group(1)
+
+            async def gone(path, secs):
+                for _ in range(int(secs * 10)):
+                    if not os.path.exists(path):
+                        return True
+                    await asyncio.sleep(0.1)
+                return False
+
+            if FULL:
+                print("== 9. el dump se borra solo cuando el enlace termina")
+
+                o, f, _ = await new_job("rev")
+                check("dump existe antes de revocar", os.path.exists(f))
+                await gateway.revoke(o.link["id"])
+                check("revocar borra el dump (sin keep_file)", await gone(f, 4))
+
+                o, f, _ = await new_job("exp")
+                con = sqlite3.connect(os.path.join(tmp, "gw-data", "gateway.db"))
+                con.execute("UPDATE links SET expires_at = expires_at - 7200 WHERE id = ?", (o.link["id"],))
+                con.commit()
+                con.close()
+                check("caducar el enlace borra el dump", await gone(f, 4))
+
+                o, f, t = await new_job("quiet")
+                await asyncio.sleep(2.5)
+                check("un enlace vigente sin descargar conserva su dump", os.path.exists(f))
+
+                o, f, t = await new_job("exh")
+                async with http.post(f"{base}/d/{t}", allow_redirects=False) as r:
+                    s9 = base + r.headers["Location"]
+                async with http.get(s9) as r:
+                    await r.read()
+                check("agotado: el dump sigue durante la gracia", os.path.exists(f))
+                check("agotado: se borra al terminar la gracia", await gone(f, 9))
+                async with http.get(s9) as r:
+                    check("sesión vencida tras la gracia: ya no sirve (410, o 404 si la limpieza la purgó)", r.status in (404, 410), r.status)
+
+
+            print("== 10. verificación de origen en el POST")
+            o, f, t = await new_job("origin", max_dl=5)
+            cases = [
+                ("Origin: null + same-origin (navegador real)", {"Origin": "null", "Sec-Fetch-Site": "same-origin"}, 303),
+                ("sin cabeceras (curl)", {}, 303),
+                ("Sec-Fetch-Site: none", {"Sec-Fetch-Site": "none"}, 303),
+                ("Sec-Fetch-Site: cross-site", {"Sec-Fetch-Site": "cross-site"}, 403),
+                ("Sec-Fetch-Site: same-site", {"Sec-Fetch-Site": "same-site"}, 403),
+                ("Origin de otro host", {"Origin": "https://evil.example"}, 403),
+            ]
+            for desc, headers, want in cases:
+                async with http.post(f"{base}/d/{t}", headers=headers, allow_redirects=False) as r:
+                    check(f"POST {desc}: {want}", r.status == want, r.status)
+
         print("== 8. el token nunca queda en logs ni en auditorías")
         await asyncio.sleep(0.3)
         haystack = ""
@@ -223,7 +292,6 @@ async def main():
         check("token del gateway ausente", GATEWAY_TOKEN not in haystack)
         check("la auditoría del gateway registra la descarga",
               '"download_completed"' in open(os.path.join(tmp, "gw-data", "audit.jsonl")).read())
-        check("el dump del runner quedó 0600", oct(os.stat(file_path).st_mode & 0o777) == "0o600")
     finally:
         await gateway.close()
         if gw.returncode is None:

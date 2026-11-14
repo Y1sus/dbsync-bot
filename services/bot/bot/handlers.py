@@ -3,7 +3,6 @@
 # Autor: Jesús Montalvo <jmontalvo_m@outlook.com>
 # =============================================================================
 
-import asyncio
 import contextlib
 import logging
 from dataclasses import dataclass
@@ -12,7 +11,7 @@ from aiogram import BaseMiddleware, Bot, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
-    CallbackQuery, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup,
+    CallbackQuery, CopyTextButton, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup,
     LinkPreviewOptions, Message, Update,
 )
 
@@ -20,6 +19,7 @@ from . import flow
 from .auth import RejectLimiter, decide
 from .gateway_client import GatewayError
 from .jobs import DumpRequest, new_job_id
+from .notify import report_job
 from .runner_client import RunnerError
 
 log = logging.getLogger("bot.handlers")
@@ -44,8 +44,14 @@ def markup(rows):
     if not rows:
         return None
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=b.text, callback_data=b.data) for b in row] for row in rows
+        [_button(b) for b in row] for row in rows
     ])
+
+
+def _button(b):
+    if b.copy_text is not None:
+        return InlineKeyboardButton(text=b.text, copy_text=CopyTextButton(text=b.copy_text))
+    return InlineKeyboardButton(text=b.text, callback_data=b.data)
 
 
 async def send(message: Message, view: flow.View) -> Message:
@@ -61,6 +67,20 @@ async def edit(bot: Bot, chat_id, message_id, text, keyboard=None):
         if "message is not modified" in str(exc):
             return
         raise
+
+
+class JobSink:
+    """Destino de los mensajes de un job: edita el progreso y envía el aviso final como mensaje nuevo."""
+
+    def __init__(self, bot: Bot, chat_id, message_id):
+        self.bot, self.chat_id, self.message_id = bot, chat_id, message_id
+
+    async def edit(self, text, keyboard=None):
+        await edit(self.bot, self.chat_id, self.message_id, text, keyboard)
+
+    async def send(self, text, keyboard=None):
+        await self.bot.send_message(self.chat_id, text, parse_mode="HTML", reply_markup=markup(keyboard),
+                                    link_preview_options=NO_PREVIEW, disable_notification=False)
 
 
 class AuthMiddleware(BaseMiddleware):
@@ -95,35 +115,9 @@ def build_router(app: App) -> Router:
     async def runner_failure(message, exc, what):
         await send(message, flow.View(flow.fmt_failure(exc.code, exc.message, exc.stderr, what)))
 
-    async def report(bot, chat_id, message_id, req, job_id):
-        async def queued(position):
-            await edit(bot, chat_id, message_id, flow.fmt_queued(position))
-
-        async def started():
-            await edit(bot, chat_id, message_id, flow.fmt_started(req))
-
-        try:
-            outcome = await app.jobs.run(req, job_id, on_queued=queued, on_start=started)
-        except asyncio.CancelledError:
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(edit(bot, chat_id, message_id, "El dump se canceló porque el bot se reinició."), 3)
-            raise
-        if outcome.kind == "ok":
-            text = flow.fmt_success(outcome, req)
-        elif outcome.kind == "link_failed":
-            text = flow.fmt_link_failure(outcome)
-        else:
-            text = flow.fmt_failure(outcome.code, outcome.message, outcome.stderr)
-        try:
-            await edit(bot, chat_id, message_id, text)
-        except TelegramAPIError:
-            log.warning("No se pudo editar el mensaje del job; se envía uno nuevo")
-            with contextlib.suppress(TelegramAPIError):
-                await bot.send_message(chat_id, text, parse_mode="HTML", link_preview_options=NO_PREVIEW)
-
     def start_job(bot, chat_id, message_id, req, update_id):
         job_id = new_job_id(update_id)
-        app.jobs.spawn(report(bot, chat_id, message_id, req, job_id))
+        app.jobs.spawn(report_job(app.jobs, req, job_id, JobSink(bot, chat_id, message_id)))
 
     @router.message(Command("start", "help"))
     async def cmd_help(message: Message):
@@ -174,7 +168,7 @@ def build_router(app: App) -> Router:
             text = "Ese enlace no existe." if exc.code == "not_found" else flow.fmt_gateway_error(exc)
             return await send(message, flow.View(text))
         app.audit.write("link_revoked", user_id=message.from_user.id, link_id=link_id)
-        await send(message, flow.View(f"Enlace <code>{link_id}</code> revocado."))
+        await send(message, flow.View(flow.fmt_revoked(link_id)))
 
     @router.message(Command("status"))
     async def cmd_status(message: Message):
@@ -237,11 +231,11 @@ def build_router(app: App) -> Router:
                 return await cb.answer(flow.fmt_gateway_error(exc)[:150], show_alert=True)
         else:
             app.audit.write("link_revoked", user_id=cb.from_user.id, link_id=link_id)
-        await cb.answer("Enlace revocado.")
+        await cb.answer(flow.REVOKED_NOTE)
         try:
-            view = flow.fmt_links(await app.gateway.list_links())
+            view = flow.fmt_links(await app.gateway.list_links(), notice=flow.REVOKED_NOTE)
         except GatewayError:
-            view = flow.View(f"Enlace <code>{link_id}</code> revocado.")
+            view = flow.View(flow.fmt_revoked(link_id))
         await edit(bot, chat_id, message_id, view.text, view.keyboard)
 
     @router.errors()

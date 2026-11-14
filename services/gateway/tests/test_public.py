@@ -34,8 +34,9 @@ class ConteoTests(GatewayCase):
         self.assertEqual((status, body), (200, self.payload))
         self.assertIn("attachment", headers["Content-Disposition"])
         self.assertEqual(headers["Accept-Ranges"], "bytes")
-        self.assertEqual((await self.link_state(link))["downloads_completed"], 1)
+        self.assertEqual((await self.counted(link))["downloads_completed"], 1)
         await self.fetch(loc)
+        await self.idle()
         self.assertEqual((await self.link_state(link))["downloads_completed"], 1)
         events = [e["event"] for e in self.audit_events()]
         self.assertEqual(events.count("download_completed"), 1)
@@ -50,17 +51,20 @@ class ConteoTests(GatewayCase):
         s2, h2, b2 = await self.fetch(loc, "bytes=500-")
         self.assertEqual((s2, h2["Content-Range"]), (206, "bytes 500-999/1000"))
         self.assertEqual(b1 + b2, self.payload)
-        self.assertEqual((await self.link_state(link))["downloads_completed"], 1)
+        self.assertEqual((await self.counted(link))["downloads_completed"], 1)
 
     async def test_ultimo_rango_primero_y_sesion_sigue(self):
         link = await self.create_link()
         loc = await self.open_session(link)
         s, _, b = await self.fetch(loc, "bytes=-100")
         self.assertEqual((s, b), (206, self.payload[-100:]))
-        state = await self.link_state(link)
-        self.assertEqual((state["downloads_completed"], state["state"]), (1, "exhausted"))
+        self.assertEqual((await self.link_state(link))["downloads_completed"], 0)
         s, _, b = await self.fetch(loc, "bytes=0-899")
         self.assertEqual((s, b), (206, self.payload[:900]))
+        state = await self.counted(link)
+        self.assertEqual((state["downloads_completed"], state["state"]), (1, "exhausted"))
+        s, _, b = await self.fetch(loc, "bytes=0-99")
+        self.assertEqual((s, b), (206, self.payload[:100]))
         self.assertEqual((await self.link_state(link))["downloads_completed"], 1)
 
     async def test_abortada_no_cuenta(self):
@@ -78,6 +82,7 @@ class ConteoTests(GatewayCase):
         events = [e["event"] for e in self.audit_events()]
         self.assertIn("download_aborted", events)
         self.assertNotIn("download_completed", events)
+        await self.idle()
         state = await self.link_state(link)
         self.assertEqual((state["downloads_completed"], state["state"]), (0, "active"))
         self.assertFalse(state["download_in_progress"])
@@ -110,7 +115,7 @@ class ConteoTests(GatewayCase):
         link = await self.create_link(max_downloads=5)
         loc = await self.open_session(link)
         await asyncio.gather(*[self.fetch(loc) for _ in range(6)])
-        self.assertEqual((await self.link_state(link))["downloads_completed"], 1)
+        self.assertEqual((await self.counted(link))["downloads_completed"], 1)
 
 
 class EstadosTests(GatewayCase):
@@ -188,7 +193,7 @@ class RangoHttpTests(GatewayCase):
         s, h, b = await self.fetch(loc, "bytes=0-1,5-6")
         self.assertEqual((s, b), (200, self.payload))
         self.assertNotIn("Content-Range", h)
-        self.assertEqual((await self.link_state(link))["downloads_completed"], 1)
+        self.assertEqual((await self.counted(link))["downloads_completed"], 1)
         s, _, b = await self.fetch(loc, "bytes=0-0")
         self.assertEqual((s, b), (206, self.payload[:1]))
 

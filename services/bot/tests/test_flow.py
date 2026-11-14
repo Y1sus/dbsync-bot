@@ -225,11 +225,22 @@ class MessageTests(unittest.TestCase):
 
     def test_success(self):
         now = datetime(2026, 11, 13, 16, 0, tzinfo=timezone.utc)
-        text = flow.fmt_success(Outcome("ok", "j", self.dump, self.link), self.req, now)
-        for needle in ("5.0 MB", "abababababab…", "1 min 15 s", "2026-11-13 18:00 UTC (en 2 h)", "https://d.test/d/tok", "Descargas máximas: 2"):
+        text = flow.fmt_job_success(Outcome("ok", "j", self.dump, self.link), self.req, now).text
+        for needle in ("5.0 MB", "abababababab…", "1 min 15 s", "2026-11-13 18:00 UTC (en 2 h)", "<code>https://d.test/d/tok</code>", "2 descarga(s)"):
             self.assertIn(needle, text)
         self.assertNotIn("<script>", text)
         self.assertNotIn("f<1>", text)
+
+    def test_revoked_text_does_not_promise_immediate_delete(self):
+        for text in (flow.REVOKED_NOTE, flow.fmt_revoked("0123456789ab")):
+            self.assertIn("revocado; el dump se eliminará", text)
+            self.assertNotIn("eliminado", text)
+
+    def test_links_view_mentions_purge_and_notice(self):
+        rec = [{"id": "0123456789ab", "filename": "f", "expires_at": "2026-11-13T18:00:00Z", "downloads_completed": 0, "max_downloads": 1}]
+        self.assertIn("Al revocar o al vencer un enlace se elimina el dump.", flow.fmt_links(rec).text)
+        v = flow.fmt_links([], notice=flow.REVOKED_NOTE)
+        self.assertTrue(v.text.startswith(flow.REVOKED_NOTE))
 
     def test_failure_has_code_pre_and_no_traceback(self):
         text = flow.fmt_failure("E_SSH", "x", "línea <1>\nConnection refused")

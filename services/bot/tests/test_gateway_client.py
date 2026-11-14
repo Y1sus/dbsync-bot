@@ -52,6 +52,20 @@ class GatewayClientTests(unittest.IsolatedAsyncioTestCase):
             await self.client.revoke("0" * 12)
         self.assertEqual((cm.exception.status, cm.exception.code), (404, "not_found"))
 
+    async def test_revoke_deletes_file_by_default_and_is_idempotent(self):
+        rec = await self.create()
+        await self.client.revoke(rec["id"])
+        await self.client.revoke(rec["id"])
+        dels = [r for r in self.gw.requests if r["method"] == "DELETE"]
+        self.assertEqual([r["query"] for r in dels], [{}, {}])
+        self.assertEqual(self.gw.deleted_files, {rec["relpath"]})
+
+    async def test_revoke_keep_file_sends_flag(self):
+        rec = await self.create()
+        await self.client.revoke(rec["id"], keep_file=True)
+        self.assertEqual(self.gw.requests[-1]["query"], {"keep_file": "1"})
+        self.assertEqual(self.gw.deleted_files, set())
+
     async def test_revoke_rejects_malformed_id_without_request(self):
         n = len(self.gw.requests)
         with self.assertRaises(GatewayError):

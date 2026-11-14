@@ -29,6 +29,8 @@ def validate_relpath(relpath):
             raise PathError("invalid_request", "relpath contiene componentes no permitidos")
     if not relpath.endswith(SUFFIX):
         raise PathError("invalid_request", "relpath debe terminar en .sql.gz")
+    if len(parts) != 2:
+        raise PathError("invalid_request", "relpath debe tener la forma <servidor>/<archivo>.sql.gz")
     return parts
 
 

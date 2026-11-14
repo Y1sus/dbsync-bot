@@ -58,6 +58,16 @@ assert_not_contains "password ausente de argv" "p'a" "$(grep '^ARGV' "$T/ssh.log
 assert_contains "MYSQL_PWD heredado intacto" "MYSQL_PWD=$PW" "$(cat "$T/envlog")"
 assert_contains "ssh con host key estricta" "StrictHostKeyChecking=yes" "$(grep '^ARGV' "$T/ssh.log" | head -1)"
 
+# Dos dumps de la misma base en el mismo segundo no se pisan (el job_id va en el nombre)
+run_runner dump --server gate --container fakemysql --db appdb --job-id jobA
+FA="$(jqv .file)"
+run_runner dump --server gate --container fakemysql --db appdb --job-id jobB
+FB="$(jqv .file)"
+assert_eq "dumps simultáneos: nombres distintos" 1 "$([[ "$FA" != "$FB" ]] && echo 1 || echo 0)"
+assert_file "dumps simultáneos: el primero sigue en disco" "$FA"
+assert_contains "el nombre incluye el job_id" "_jobA.sql.gz" "$FA"
+rm -f "$FA" "$FB"
+
 run_runner dump --server gate --container fakepg --db pgapp
 assert_eq "dump pg: ok" true "$(jqv .ok)"
 assert_eq "dump pg: motor" postgresql "$(jqv .engine)"

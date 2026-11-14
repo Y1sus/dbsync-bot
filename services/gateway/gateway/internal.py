@@ -7,12 +7,11 @@ import hmac
 import logging
 import re
 import shutil
-import os
 
 from aiohttp import web
 
 from .context import Context
-from . import paths, tokens
+from . import cleanup, paths, tokens
 from .audit import client_info, iso_utc
 
 log = logging.getLogger("gateway.internal")
@@ -116,9 +115,12 @@ async def auth(request, handler):
     ctx = request.app[CTX]
     header = request.headers.get("Authorization", "")
     scheme, _, supplied = header.partition(" ")
-    ok = scheme.lower() == "bearer" and hmac.compare_digest(
-        supplied.strip().encode("utf-8"), ctx.api_token.encode("utf-8")
-    )
+    try:
+        ok = scheme.lower() == "bearer" and hmac.compare_digest(
+            supplied.strip().encode("utf-8", "surrogateescape"), ctx.api_token.encode("utf-8")
+        )
+    except UnicodeError:
+        ok = False
     if not ok:
         raise ApiError(401, "unauthorized", "Token ausente o incorrecto")
     return await handler(request)
@@ -186,29 +188,20 @@ async def get_link(request):
     return web.json_response(record(link, ctx))
 
 
-def _delete_file_if_unused(ctx, link, now):
-    with ctx.store.locked():
-        if link["relpath"] in ctx.store.referenced_relpaths(now):
-            return False
-        try:
-            candidate, _ = paths.resolve_dump(ctx.config.dumps_root, link["relpath"])
-            os.unlink(candidate)
-        except (paths.PathError, OSError):
-            return False
-        return True
-
-
 async def revoke_link(request):
     ctx = request.app[CTX]
     now = ctx.now()
-    link = await ctx.db(ctx.store.revoke, _link_id(request), now)
+    keep = request.query.get("keep_file") == "1"
+    link, changed = await ctx.db(ctx.store.revoke, _link_id(request), now, keep)
     if link is None:
         raise ApiError(404, "not_found", "Enlace no encontrado")
-    ip, ua = client_info(request)
-    ctx.audit.log("link_revoked", link["id"], ip, ua)
-    if request.query.get("delete_file") == "1":
-        if await ctx.db(_delete_file_if_unused, ctx, link, now):
-            ctx.audit.log("file_deleted", link["id"], relpath=link["relpath"], reason="revoke")
+    if ctx.active.busy(link["id"]):
+        ctx.revoked.add(link["id"])
+    if changed:
+        ip, ua = client_info(request)
+        ctx.audit.log("link_revoked", link["id"], ip, ua)
+    if not keep:
+        await ctx.db(cleanup.delete_finished, ctx, link["relpath"], now, "link_revoked")
     return web.Response(status=204)
 
 
@@ -219,9 +212,14 @@ async def health(request):
     return web.json_response({"ok": True, "links_active": active, "disk_free_mb": free})
 
 
+async def _server_header(request, response):
+    response.headers["Server"] = "gateway"
+
+
 def create_app(ctx):
     app = web.Application(middlewares=[errors, auth], client_max_size=16 * 1024)
     app[CTX] = ctx
+    app.on_response_prepare.append(_server_header)
     app.router.add_post("/v1/links", create_link)
     app.router.add_get("/v1/links", list_links)
     app.router.add_get("/v1/links/{id}", get_link)

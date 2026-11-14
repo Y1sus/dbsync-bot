@@ -35,6 +35,7 @@ deploy/                   runbook y vhost nginx de dumps.synkra.app
 servers/example.env       plantilla de servidor (los .env reales no se commitean)
 secrets/                  token del bot, llave SSH dedicada y known_hosts (ignorado por git)
 scripts/test.sh           puerta de todos los servicios en paralelo (~2 s); --eval agrega evals
+scripts/deploy.sh         actualiza el VPS (imágenes por docker save, código por git archive)
 .githooks/pre-commit      corre scripts/test.sh antes de cada commit
 ```
 

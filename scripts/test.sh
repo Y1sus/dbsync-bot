@@ -35,7 +35,7 @@ wait_suites() {
 
 if command -v shellcheck >/dev/null; then
     run_suite shellcheck shellcheck -x -S warning services/runner/runner.sh services/runner/lib/*.sh \
-        services/runner/tests/*.sh services/runner/tests/shims/* services/runner/evals/*.sh scripts/*.sh .githooks/*
+        services/runner/tests/*.sh services/runner/tests/shims/* services/runner/evals/*.sh scripts/*.sh scripts/tests/*.sh .githooks/*
 else
     echo "WARN shellcheck no instalado: se omite el lint"
 fi
@@ -43,6 +43,7 @@ run_suite runner bash services/runner/tests/run.sh
 run_suite gateway bash -c "cd services/gateway && '$PY' -m unittest discover -s tests -t ."
 run_suite bot bash -c "cd services/bot && '$PY' -m unittest discover -s tests -t ."
 run_suite integracion "$PY" integration/e2e_stack.py
+run_suite deploy bash scripts/tests/test_deploy.sh
 if command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then
     run_suite compose env GATEWAY_PUBLIC_BASE_URL=https://dumps.example BOT_ALLOWED_USER_IDS=1 docker compose config -q
 fi
@@ -53,6 +54,8 @@ if [[ "${1:-}" == "--eval" ]]; then
     run_suite eval-runner bash services/runner/evals/e2e_dump.sh
     run_suite eval-gateway bash -c "cd services/gateway && '$PY' evals/e2e_gateway.py"
     run_suite eval-bot bash -c "cd services/bot && '$PY' evals/e2e_bot.py"
+    run_suite eval-integracion "$PY" integration/e2e_stack.py --full
+    run_suite eval-nginx bash scripts/tests/eval_nginx.sh
     wait_suites
 fi
 (( rc == 0 )) && echo "TODO OK" || echo "HAY FALLOS"

@@ -26,6 +26,19 @@ class Config:
     session_ttl: int = 7200
     block_size: int = 256 * 1024
     closed_rows_days: int = 7
+    post_download_grace: int = 900
+    miss_limit: int = 20
+    miss_window: float = 60.0
+    block_seconds: int = 300
+    max_streams: int = 4
+    limiter_max_ips: int = 10000
+    write_timeout: float = 20.0
+    max_streams_per_link: int = 2
+    min_rate_bytes: int = 32768
+    min_rate_after: float = 30.0
+    max_stream_seconds: int = 7200
+    audit_max_mb: float = 50.0
+    audit_keep: int = 5
 
 
 def _number(env, name, default, kind, lo, hi):
@@ -64,6 +77,15 @@ def from_env(env=None):
         retention_hours=_number(env, "GATEWAY_RETENTION_HOURS", 24.0, float, 0.01, 8760),
         max_dumps_gb=_number(env, "GATEWAY_MAX_DUMPS_GB", 10.0, float, 0.001, 100000),
         cleanup_interval=_number(env, "GATEWAY_CLEANUP_INTERVAL_SECONDS", 60.0, float, 1, 86400),
+        post_download_grace=_number(env, "GATEWAY_POST_DOWNLOAD_GRACE_SECONDS", 900, int, 0, 7200),
+        miss_limit=_number(env, "GATEWAY_MISS_LIMIT", 20, int, 1, 100000),
+        block_seconds=_number(env, "GATEWAY_BLOCK_SECONDS", 300, int, 1, 86400),
+        max_streams=_number(env, "GATEWAY_MAX_STREAMS", 4, int, 1, 1000),
+        max_streams_per_link=_number(env, "GATEWAY_MAX_STREAMS_PER_LINK", 2, int, 1, 1000),
+        min_rate_bytes=_number(env, "GATEWAY_MIN_RATE_BYTES", 32768, int, 0, 10 ** 9),
+        max_stream_seconds=_number(env, "GATEWAY_MAX_STREAM_SECONDS", 7200, int, 1, 604800),
+        audit_max_mb=_number(env, "GATEWAY_AUDIT_MAX_MB", 50.0, float, 0.001, 10240),
+        audit_keep=_number(env, "GATEWAY_AUDIT_KEEP", 5, int, 1, 100),
     )
 
 

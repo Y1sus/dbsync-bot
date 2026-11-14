@@ -3,14 +3,16 @@
 # Autor: Jesús Montalvo <jmontalvo_m@outlook.com>
 # =============================================================================
 
+import json
 import os
 import sqlite3
 import threading
 from contextlib import contextmanager
 
 from . import tokens
+from .coverage import covers, merge
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE links (
@@ -28,7 +30,8 @@ CREATE TABLE links (
     job_id TEXT NOT NULL,
     label TEXT,
     revoked_at INTEGER,
-    closed_at INTEGER
+    closed_at INTEGER,
+    keep_file INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX links_relpath ON links(relpath);
 CREATE TABLE sessions (
@@ -36,7 +39,9 @@ CREATE TABLE sessions (
     link_id TEXT NOT NULL REFERENCES links(id) ON DELETE CASCADE,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
-    counted INTEGER NOT NULL DEFAULT 0
+    counted INTEGER NOT NULL DEFAULT 0,
+    ranges TEXT NOT NULL DEFAULT '[]',
+    budget_used INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX sessions_link ON sessions(link_id);
 """
@@ -55,6 +60,7 @@ def compute_state(row, now):
 class Store:
     def __init__(self, path):
         self._lock = threading.RLock()
+        os.close(os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600))
         self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None, timeout=10)
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
@@ -70,6 +76,14 @@ class Store:
                 self._db.executescript(
                     f"BEGIN; {_SCHEMA} PRAGMA user_version={SCHEMA_VERSION}; COMMIT;"
                 )
+            elif version in (1, 2):
+                steps = ["BEGIN;"]
+                if version < 2:
+                    steps.append("ALTER TABLE links ADD COLUMN keep_file INTEGER NOT NULL DEFAULT 0;")
+                steps.append("ALTER TABLE sessions ADD COLUMN ranges TEXT NOT NULL DEFAULT '[]';")
+                steps.append("ALTER TABLE sessions ADD COLUMN budget_used INTEGER NOT NULL DEFAULT 0;")
+                steps.append(f"PRAGMA user_version={SCHEMA_VERSION}; COMMIT;")
+                self._db.executescript(" ".join(steps))
             elif version != SCHEMA_VERSION:
                 raise RuntimeError(f"Versión de esquema no soportada: {version}")
 
@@ -130,20 +144,23 @@ class Store:
     def count_active(self, now):
         return len(self.list_links(now, True))
 
-    def revoke(self, link_id, now):
+    def revoke(self, link_id, now, keep_file=False):
+        """Revoca y cierra sesiones. Devuelve (enlace, cambió) o (None, False) si no existe."""
         with self._tx() as db:
             row = db.execute("SELECT * FROM links WHERE id=?", (link_id,)).fetchone()
             if row is None:
-                return None
-            if row["revoked_at"] is None:
+                return None, False
+            changed = row["revoked_at"] is None
+            if changed:
                 db.execute(
                     "UPDATE links SET revoked_at=?, closed_at=COALESCE(closed_at, ?) WHERE id=?",
                     (now, now, link_id),
                 )
                 db.execute("DELETE FROM sessions WHERE link_id=?", (link_id,))
-            return self._link(db.execute("SELECT * FROM links WHERE id=?", (link_id,)).fetchone(), now)
+            db.execute("UPDATE links SET keep_file=? WHERE id=?", (1 if keep_file else 0, link_id))
+            return self._link(db.execute("SELECT * FROM links WHERE id=?", (link_id,)).fetchone(), now), changed
 
-    def open_or_reuse_session(self, link_id, now, ttl):
+    def open_or_reuse_session(self, link_id, now, ttl, grace):
         """Devuelve (estado, id_sesion). estado: ok, not_found, revoked, exhausted, expired."""
         with self._tx() as db:
             link = db.execute("SELECT * FROM links WHERE id=?", (link_id,)).fetchone()
@@ -164,7 +181,7 @@ class Store:
             session_id = tokens.new_session_id()
             db.execute(
                 "INSERT INTO sessions (id, link_id, created_at, expires_at) VALUES (?,?,?,?)",
-                (session_id, link_id, now, now + ttl),
+                (session_id, link_id, now, min(now + ttl, link["expires_at"] + grace)),
             )
             return "ok", session_id
 
@@ -175,32 +192,72 @@ class Store:
             ).fetchone()
             return dict(row) if row else None
 
-    def mark_counted(self, session_id, now):
-        """Cuenta la descarga una sola vez por sesión. True si esta llamada la contó."""
+    def reserve_bytes(self, session_id, length, size, now):
+        """Reserva `length` bytes del presupuesto (2 x size) de la sesión: ok, session o budget."""
         with self._tx() as db:
-            session = db.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
-            if session is None or session["counted"]:
+            row = db.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+            if row is None or row["expires_at"] <= now:
+                return "session"
+            if row["budget_used"] + length > 2 * size:
+                return "budget"
+            db.execute("UPDATE sessions SET budget_used=budget_used+? WHERE id=?", (length, session_id))
+            return "ok"
+
+    def record_sent(self, session_id, start, sent, reserved, credited, size, now, grace):
+        """Registra bytes enviados, devuelve lo no enviado y cuenta si la unión cubre [0, size)."""
+        with self._tx() as db:
+            row = db.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+            if row is None:
                 return False
-            db.execute("UPDATE sessions SET counted=1 WHERE id=?", (session_id,))
-            cur = db.execute(
-                "UPDATE links SET downloads_completed=downloads_completed+1"
-                " WHERE id=? AND downloads_completed<max_downloads AND revoked_at IS NULL",
-                (session["link_id"],),
+            ranges = merge(json.loads(row["ranges"]), start, start + credited)
+            used = max(0, row["budget_used"] - (reserved - sent))
+            counted_now = False
+            counted, expires = row["counted"], row["expires_at"]
+            if not counted and covers(ranges, size):
+                counted, expires = 1, min(expires, now + grace)
+                cur = db.execute(
+                    "UPDATE links SET downloads_completed=downloads_completed+1"
+                    " WHERE id=? AND downloads_completed<max_downloads AND revoked_at IS NULL",
+                    (row["link_id"],),
+                )
+                counted_now = cur.rowcount == 1
+            db.execute(
+                "UPDATE sessions SET ranges=?, budget_used=?, counted=?, expires_at=? WHERE id=?",
+                (json.dumps(ranges, separators=(",", ":")), used, counted, expires, session_id),
             )
-            return cur.rowcount == 1
+            return counted_now
 
-    def referenced_relpaths(self, now):
+    def file_status(self, relpath, now):
+        """Resume los enlaces de un relpath para decidir el borrado (llamar bajo locked())."""
         with self._lock:
-            rows = self._db.execute(
-                "SELECT DISTINCT relpath FROM links WHERE revoked_at IS NULL AND ("
-                " (downloads_completed<max_downloads AND expires_at>?)"
-                " OR id IN (SELECT link_id FROM sessions WHERE expires_at>?))",
-                (now, now),
-            ).fetchall()
-        return {row["relpath"] for row in rows}
+            rows = self._db.execute("SELECT * FROM links WHERE relpath=?", (relpath,)).fetchall()
+            open_sessions = self._db.execute(
+                "SELECT COUNT(*) FROM sessions s JOIN links l ON l.id=s.link_id"
+                " WHERE l.relpath=? AND s.expires_at>?",
+                (relpath, now),
+            ).fetchone()[0]
+        states = [compute_state(row, now) for row in rows]
+        last = None
+        for row, state in zip(rows, states):
+            if state == "active":
+                continue
+            if row["revoked_at"] is not None:
+                moment = row["revoked_at"]
+            else:
+                moment = row["closed_at"] if row["closed_at"] is not None else row["expires_at"]
+            if last is None or moment >= last[0]:
+                last = (moment, row["id"], state)
+        return {
+            "rows": len(rows),
+            "link_ids": [row["id"] for row in rows],
+            "all_terminal": bool(rows) and all(state != "active" for state in states),
+            "open_sessions": open_sessions > 0,
+            "kept": any(row["keep_file"] for row in rows),
+            "last": last,
+        }
 
-    def sweep(self, now, keep_closed_seconds):
-        """Marca enlaces cerrados, purga sesiones vencidas y filas viejas."""
+    def close_expired(self, now):
+        """Marca enlaces expirados/agotados y purga sesiones vencidas."""
         closed = []
         with self._tx() as db:
             for row in db.execute("SELECT * FROM links WHERE closed_at IS NULL").fetchall():
@@ -209,8 +266,11 @@ class Store:
                     db.execute("UPDATE links SET closed_at=? WHERE id=?", (now, row["id"]))
                     closed.append((row["id"], state))
             db.execute("DELETE FROM sessions WHERE expires_at<=?", (now,))
-            deleted = db.execute(
+        return closed
+
+    def purge_closed(self, now, keep_closed_seconds):
+        with self._tx() as db:
+            return db.execute(
                 "DELETE FROM links WHERE closed_at IS NOT NULL AND closed_at<=?",
                 (now - keep_closed_seconds,),
             ).rowcount
-        return closed, deleted

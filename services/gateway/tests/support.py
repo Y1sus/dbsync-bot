@@ -3,6 +3,7 @@
 # Autor: Jesús Montalvo <jmontalvo_m@outlook.com>
 # =============================================================================
 
+import asyncio
 import hashlib
 import json
 import os
@@ -78,6 +79,11 @@ def validate(instance, schema, defs, path="$"):
 class GatewayCase(unittest.IsolatedAsyncioTestCase):
     FILE_SIZE = 1000
     BLOCK = 128
+    CONFIG = {}
+
+    def _setupAsyncioRunner(self):
+        """Sin modo debug de asyncio: es más rápido y evita falsos avisos de callbacks lentos."""
+        self._asyncioRunner = asyncio.Runner(debug=False, loop_factory=self.loop_factory)
 
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -94,7 +100,7 @@ class GatewayCase(unittest.IsolatedAsyncioTestCase):
         self.config = Config(
             dumps_root=self.dumps, data_dir=self.data, public_base_url="https://dumps.example.test",
             api_token_file=token_file, public_port=0, internal_port=0, bind_host="127.0.0.1",
-            cleanup_interval=3600, block_size=self.BLOCK,
+            cleanup_interval=3600, block_size=self.BLOCK, **self.CONFIG,
         )
         self.clock = FakeClock()
         self.ctx = build_context(self.config, self.clock)
@@ -137,10 +143,32 @@ class GatewayCase(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(resp.status, 303)
             return resp.headers["Location"]
 
+    async def post(self, link, headers=None):
+        async with self.http.post(f"{self.pub}/d/{link['token']}", headers=headers or {},
+                                  allow_redirects=False) as resp:
+            await resp.read()
+            return resp.status, dict(resp.headers)
+
     async def fetch(self, location, rng=None, method="GET"):
         headers = {"Range": rng} if rng else {}
         async with self.http.request(method, self.pub + location, headers=headers) as resp:
             return resp.status, dict(resp.headers), await resp.read()
+
+    async def counted(self, link, expected=1):
+        """Espera a que el servidor registre el conteo (ocurre tras entregar el último byte)."""
+        for _ in range(300):
+            data = await self.link_state(link)
+            if data["downloads_completed"] >= expected:
+                return data
+            await asyncio.sleep(0.01)
+        return data
+
+    async def idle(self):
+        """Espera a que el servidor libere los streams (tras responder aún cierra y registra)."""
+        for _ in range(300):
+            if self.ctx.active.total == 0:
+                return
+            await asyncio.sleep(0.01)
 
     async def link_state(self, link):
         return (await self.api("GET", f"/v1/links/{link['id']}"))[1]

@@ -129,24 +129,31 @@ class ListarYRevocarTests(GatewayCase):
                 status, data = await self.api(method, path)
                 self.assertEqual((status, data["error"]["code"]), (404, "not_found"))
 
-    async def test_delete_idempotente_conserva_archivo(self):
+    async def test_delete_borra_el_archivo_y_es_idempotente(self):
         link = await self.create_link()
         self.assertEqual((await self.api("DELETE", f"/v1/links/{link['id']}"))[0], 204)
-        self.assertEqual((await self.api("DELETE", f"/v1/links/{link['id']}"))[0], 204)
-        self.assertTrue(os.path.exists(self.dump_path))
-
-    async def test_delete_file_si_nadie_mas_lo_usa(self):
-        link = await self.create_link()
-        self.assertEqual((await self.api("DELETE", f"/v1/links/{link['id']}?delete_file=1"))[0], 204)
         self.assertFalse(os.path.exists(self.dump_path))
+        self.assertEqual((await self.api("DELETE", f"/v1/links/{link['id']}"))[0], 204)
+        self.assertEqual((await self.api("DELETE", "/v1/links/ffffffffffff"))[0], 404)
         self.assertIn("file_deleted", [e["event"] for e in self.audit_events()])
 
-    async def test_delete_file_respeta_otro_enlace_activo(self):
+    async def test_delete_keep_file_conserva_el_archivo(self):
+        link = await self.create_link()
+        self.assertEqual((await self.api("DELETE", f"/v1/links/{link['id']}?keep_file=1"))[0], 204)
+        self.assertTrue(os.path.exists(self.dump_path))
+        self.assertEqual((await self.link_state(link))["state"], "revoked")
+
+    async def test_delete_respeta_otro_enlace_activo(self):
         a = await self.create_link()
         b = await self.create_link()
-        await self.api("DELETE", f"/v1/links/{a['id']}?delete_file=1")
+        await self.api("DELETE", f"/v1/links/{a['id']}")
         self.assertTrue(os.path.exists(self.dump_path))
-        await self.api("DELETE", f"/v1/links/{b['id']}?delete_file=1")
+        await self.api("DELETE", f"/v1/links/{b['id']}")
+        self.assertFalse(os.path.exists(self.dump_path))
+
+    async def test_parametro_delete_file_ya_no_existe(self):
+        link = await self.create_link(max_downloads=2)
+        self.assertEqual((await self.api("DELETE", f"/v1/links/{link['id']}?delete_file=0"))[0], 204)
         self.assertFalse(os.path.exists(self.dump_path))
 
     async def test_download_in_progress(self):

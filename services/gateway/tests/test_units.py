@@ -9,6 +9,7 @@ import unittest
 
 from gateway import paths, tokens
 from gateway.config import ConfigError, from_env, load_api_token
+from gateway.limiter import MissLimiter, ip_key
 from gateway.ranges import RangeNotSatisfiable, parse_range
 from gateway.store import Store, compute_state
 from gateway.streaming import safe_filename
@@ -93,6 +94,13 @@ class PathTests(unittest.TestCase):
                     "srv/.oculto.sql.gz", "x" * 2000 + ".sql.gz"]:
             self.assertEqual(self.code(rel), "invalid_request", repr(rel))
 
+    def test_relpath_anidado_rechazado(self):
+        os.makedirs(os.path.join(self.root, "srv", "sub"))
+        with open(os.path.join(self.root, "srv", "sub", "x.sql.gz"), "wb") as fh:
+            fh.write(b"datos")
+        for rel in ["srv/sub/x.sql.gz", "a/b/c.sql.gz", "solo.sql.gz"]:
+            self.assertEqual(self.code(rel), "invalid_request", rel)
+
     def test_extension(self):
         self.assertEqual(self.code("srv/b.sql.gz.part"), "invalid_request")
         self.assertEqual(self.code("srv/c.txt"), "invalid_request")
@@ -152,8 +160,211 @@ class MiscTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "g.db")
             store = Store(path)
-            self.assertEqual(store._db.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(store._db.execute("PRAGMA user_version").fetchone()[0], 3)
             self.assertEqual(store._db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
             store.close()
-            self.assertEqual(Store(path)._db.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(Store(path)._db.execute("PRAGMA user_version").fetchone()[0], 3)
             self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
+
+
+V1_SCHEMA = """CREATE TABLE links (id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, relpath TEXT NOT NULL,
+filename TEXT NOT NULL, size_bytes INTEGER NOT NULL, sha256 TEXT, created_at INTEGER NOT NULL,
+expires_at INTEGER NOT NULL, max_downloads INTEGER NOT NULL, downloads_completed INTEGER NOT NULL DEFAULT 0,
+created_by TEXT NOT NULL, job_id TEXT NOT NULL, label TEXT, revoked_at INTEGER, closed_at INTEGER%s);
+CREATE TABLE sessions (id TEXT PRIMARY KEY, link_id TEXT NOT NULL, created_at INTEGER NOT NULL,
+expires_at INTEGER NOT NULL, counted INTEGER NOT NULL DEFAULT 0);
+INSERT INTO links (id, token_hash, relpath, filename, size_bytes, created_at, expires_at, max_downloads,
+created_by, job_id) VALUES ('aaaaaaaaaaaa','h','srv/a.sql.gz','a.sql.gz',5,1,100,1,'t','j');
+INSERT INTO sessions VALUES ('s1','aaaaaaaaaaaa',1,50,1);
+PRAGMA user_version=%d;"""
+
+
+class MigracionTests(unittest.TestCase):
+    def migrate(self, version):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "g.db")
+            db = sqlite3.connect(path)
+            extra = ", keep_file INTEGER NOT NULL DEFAULT 0" if version == 2 else ""
+            db.executescript(V1_SCHEMA % (extra, version))
+            db.close()
+            store = Store(path)
+            self.assertEqual(store._db.execute("PRAGMA user_version").fetchone()[0], 3)
+            row = store.get_link("aaaaaaaaaaaa", 50)
+            self.assertEqual((row["keep_file"], row["relpath"], row["state"]), (0, "srv/a.sql.gz", "active"))
+            session = store.get_session("s1", "aaaaaaaaaaaa")
+            self.assertEqual((session["counted"], session["ranges"], session["budget_used"]), (1, "[]", 0))
+            store.close()
+            Store(path).close()
+
+    def test_v1_a_v3(self):
+        self.migrate(1)
+
+    def test_v2_a_v3(self):
+        self.migrate(2)
+
+    def test_version_desconocida_falla(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "g.db")
+            db = sqlite3.connect(path)
+            db.execute("PRAGMA user_version=9")
+            db.close()
+            with self.assertRaises(RuntimeError):
+                Store(path)
+
+    def test_archivos_wal_y_shm_son_0600_aun_con_umask_flojo(self):
+        old = os.umask(0o022)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "g.db")
+                store = Store(path)
+                store.create_link(lambda: 5, "h", "srv/a.sql.gz", 60, 1, None, "t", "j", None, 1)
+                for suffix in ("", "-wal", "-shm"):
+                    if os.path.exists(path + suffix):
+                        self.assertEqual(os.stat(path + suffix).st_mode & 0o777, 0o600, suffix)
+                store.close()
+        finally:
+            os.umask(old)
+
+
+class CoberturaTests(unittest.TestCase):
+    def test_union_y_cobertura(self):
+        from gateway.coverage import MAX_INTERVALS, covers, merge
+        r = merge([], 500, 1000)
+        self.assertFalse(covers(r, 1000))
+        r = merge(r, 0, 500)
+        self.assertEqual(r, [[0, 1000]])
+        self.assertTrue(covers(r, 1000))
+        self.assertEqual(merge([[0, 10]], 10, 20), [[0, 20]])
+        self.assertEqual(merge([[0, 10]], 11, 20), [[0, 10], [11, 20]])
+        self.assertEqual(merge([[0, 10]], 5, 5), [[0, 10]])
+        self.assertFalse(covers([[0, 10], [11, 20]], 20))
+        self.assertFalse(covers([[1, 20]], 20))
+        r = []
+        for i in range(MAX_INTERVALS * 3):
+            r = merge(r, i * 10, i * 10 + 1 + (i % 3))
+        self.assertLessEqual(len(r), MAX_INTERVALS)
+
+    def test_reserva_y_devolucion_atomicas(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(os.path.join(tmp, "g.db"))
+            link = store.create_link(lambda: 100, "h", "srv/a.sql.gz", 3600, 5, None, "t", "j", None, 1000)
+            status, sid = store.open_or_reuse_session(link["id"], 1000, 7200, 900)
+            self.assertEqual(status, "ok")
+            self.assertEqual(store.reserve_bytes(sid, 100, 100, 1000), "ok")
+            self.assertEqual(store.reserve_bytes(sid, 100, 100, 1000), "ok")
+            self.assertEqual(store.reserve_bytes(sid, 1, 100, 1000), "budget")
+            store.record_sent(sid, 0, 40, 100, 40, 100, 1000, 900)
+            self.assertEqual(store.get_session(sid, link["id"])["budget_used"], 140)
+            self.assertEqual(store.reserve_bytes(sid, 60, 100, 1000), "ok")
+            self.assertEqual(store.reserve_bytes(sid, 1, 100, 1000), "budget")
+            self.assertEqual(store.reserve_bytes(sid, 1, 100, 99999), "session")
+            self.assertEqual(store.reserve_bytes("nope", 1, 100, 1000), "session")
+            store.close()
+
+    def test_vencimiento_de_sesion_acotado_por_el_enlace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(os.path.join(tmp, "g.db"))
+            link = store.create_link(lambda: 100, "h", "srv/a.sql.gz", 60, 1, None, "t", "j", None, 1000)
+            _, sid = store.open_or_reuse_session(link["id"], 1000, 7200, 900)
+            self.assertEqual(store.get_session(sid, link["id"])["expires_at"], 1000 + 60 + 900)
+            long = store.create_link(lambda: 100, "h2", "srv/b.sql.gz", 604800, 1, None, "t", "j", None, 1000)
+            _, sid2 = store.open_or_reuse_session(long["id"], 1000, 7200, 900)
+            self.assertEqual(store.get_session(sid2, long["id"])["expires_at"], 1000 + 7200)
+            store.close()
+
+
+class LimitadorTests(unittest.TestCase):
+    def setUp(self):
+        self.t = [1000.0]
+        self.lim = MissLimiter(3, 60, 300, 5, lambda: self.t[0])
+
+    def test_bloquea_al_superar_el_limite_y_desbloquea_por_tiempo(self):
+        for _ in range(3):
+            self.assertFalse(self.lim.miss("1.1.1.1"))
+        self.assertEqual(self.lim.blocked("1.1.1.1"), 0)
+        self.assertTrue(self.lim.miss("1.1.1.1"))
+        self.assertEqual(self.lim.blocked("1.1.1.1"), 300)
+        self.assertEqual(self.lim.blocked("2.2.2.2"), 0)
+        self.t[0] += 299
+        self.assertEqual(self.lim.blocked("1.1.1.1"), 1)
+        self.t[0] += 1
+        self.assertEqual(self.lim.blocked("1.1.1.1"), 0)
+
+    def test_ventana_deslizante(self):
+        for _ in range(3):
+            self.lim.miss("1.1.1.1")
+        self.t[0] += 61
+        for _ in range(3):
+            self.assertFalse(self.lim.miss("1.1.1.1"))
+        self.assertEqual(self.lim.blocked("1.1.1.1"), 0)
+
+    def test_tabla_acotada_y_bloqueados_sobreviven_al_desalojo(self):
+        for _ in range(4):
+            self.lim.miss("9.9.9.9")
+        for i in range(50):
+            self.lim.miss(f"10.0.0.{i}")
+        self.assertLessEqual(self.lim.size(), 10)
+        self.assertGreater(self.lim.blocked("9.9.9.9"), 0)
+        self.t[0] += 400
+        self.assertEqual(self.lim.blocked("9.9.9.9"), 0)
+        self.assertEqual(self.lim.size(), 5)
+
+    def test_bloqueos_tambien_acotados(self):
+        for i in range(30):
+            for _ in range(4):
+                self.lim.miss(f"10.1.0.{i}")
+        self.assertLessEqual(len(self.lim._blocked), 5)
+        self.assertGreater(self.lim.blocked("10.1.0.29"), 0)
+
+    def test_desalojo_amortizado_con_tabla_grande(self):
+        import time
+        big = MissLimiter(20, 60, 300, 10000, lambda: 1000.0)
+        for i in range(10000):
+            big.miss(f"10.{i // 65536 % 256}.{i // 256 % 256}.{i % 256}")
+        started = time.perf_counter()
+        for i in range(5000):
+            big.miss(f"172.16.{i // 256}.{i % 256}")
+        self.assertLess((time.perf_counter() - started) / 5000, 0.0002)
+        self.assertEqual(len(big._hits), 10000)
+
+    def test_ipv4_mapeada_comparte_clave_con_su_ipv4(self):
+        self.assertEqual(ip_key("::ffff:203.0.113.9"), "203.0.113.9")
+        for _ in range(4):
+            self.lim.miss("::ffff:203.0.113.9")
+        self.assertGreater(self.lim.blocked("203.0.113.9"), 0)
+
+    def test_ipv6_se_agrupa_por_prefijo_64(self):
+        self.assertEqual(ip_key("2001:db8::1"), ip_key("2001:db8::ffff"))
+        self.assertNotEqual(ip_key("2001:db8:0:1::1"), ip_key("2001:db8::1"))
+        self.assertEqual(ip_key("203.0.113.9"), "203.0.113.9")
+        for i in range(4):
+            self.lim.miss(f"2001:db8::{i + 1}")
+        self.assertGreater(self.lim.blocked("2001:db8::99"), 0)
+
+
+class ConfigNuevaTests(unittest.TestCase):
+    def test_variables_nuevas(self):
+        base = {"GATEWAY_PUBLIC_BASE_URL": "https://x.test", "GATEWAY_API_TOKEN_FILE": "/t"}
+        cfg = from_env(base)
+        self.assertEqual((cfg.post_download_grace, cfg.miss_limit, cfg.block_seconds, cfg.max_streams),
+                         (900, 20, 300, 4))
+        self.assertEqual((cfg.max_streams_per_link, cfg.min_rate_bytes, cfg.max_stream_seconds, cfg.write_timeout),
+                         (2, 32768, 7200, 20.0))
+        self.assertEqual((cfg.audit_max_mb, cfg.audit_keep), (50.0, 5))
+        cfg = from_env({**base, "GATEWAY_POST_DOWNLOAD_GRACE_SECONDS": "2", "GATEWAY_MISS_LIMIT": "3",
+                        "GATEWAY_BLOCK_SECONDS": "7", "GATEWAY_MAX_STREAMS": "9",
+                        "GATEWAY_CLEANUP_INTERVAL_SECONDS": "1"})
+        self.assertEqual((cfg.post_download_grace, cfg.miss_limit, cfg.block_seconds, cfg.max_streams,
+                          cfg.cleanup_interval), (2, 3, 7, 9, 1))
+        cfg = from_env({**base, "GATEWAY_MAX_STREAMS_PER_LINK": "1", "GATEWAY_MIN_RATE_BYTES": "5",
+                        "GATEWAY_MAX_STREAM_SECONDS": "9", "GATEWAY_AUDIT_MAX_MB": "0.5", "GATEWAY_AUDIT_KEEP": "2"})
+        self.assertEqual((cfg.max_streams_per_link, cfg.min_rate_bytes, cfg.max_stream_seconds, cfg.audit_max_mb,
+                          cfg.audit_keep), (1, 5, 9, 0.5, 2))
+        for name in ("GATEWAY_MISS_LIMIT", "GATEWAY_MAX_STREAMS", "GATEWAY_BLOCK_SECONDS",
+                     "GATEWAY_MAX_STREAMS_PER_LINK", "GATEWAY_AUDIT_KEEP", "GATEWAY_MAX_STREAM_SECONDS"):
+            with self.assertRaises(ConfigError):
+                from_env({**base, name: "0"})
+        with self.assertRaises(ConfigError):
+            from_env({**base, "GATEWAY_POST_DOWNLOAD_GRACE_SECONDS": "-1"})

@@ -87,10 +87,12 @@ class GatewayClient:
             raise GatewayError(None, "bad_response", "Respuesta del gateway inválida.")
         return [_check_record(r) for r in links]
 
-    async def revoke(self, link_id):
+    async def revoke(self, link_id, keep_file=False):
+        """Revoca el enlace; por defecto el gateway también borra el dump (keep_file=True lo conserva)."""
         if not LINK_ID_RE.match(link_id):
             raise GatewayError(None, "invalid_request", "Id de enlace inválido.")
-        await self._request("DELETE", f"/v1/links/{link_id}", (204,))
+        params = {"keep_file": "1"} if keep_file else None
+        await self._request("DELETE", f"/v1/links/{link_id}", (204,), params=params)
 
     async def health(self):
         return await self._request("GET", "/v1/health", (200,))

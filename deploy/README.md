@@ -63,6 +63,13 @@ docker compose ps && docker compose logs --tail 20 bot
 
 ## 3. nginx y TLS **(sudo)**
 
+Primero las zonas de límites y el formato de log sin token (contexto `http`), luego el vhost:
+
+```bash
+sudo cp deploy/nginx/dumps-limits.conf /etc/nginx/conf.d/dumps-limits.conf
+```
+
+
 DNS: registro A de `dumps.synkra.app` hacia `147.182.254.199` antes de certbot.
 
 ```bash
@@ -71,6 +78,11 @@ sudo ln -s /etc/nginx/sites-available/dumps.synkra.app /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
 sudo certbot --nginx -d dumps.synkra.app
 ```
+
+Si el vhost ya existe con TLS (certbot lo modificó), no lo reemplaces: edítalo y agrega solo las
+líneas nuevas del archivo de `deploy/nginx/` (`client_*_timeout`, `send_timeout`, `access_log`,
+`error_log`, y dentro de `location /d/` los `limit_*`, `Connection ""` y `proxy_hide_header Server`).
+Luego `sudo nginx -t && sudo systemctl reload nginx`.
 
 Verificación: `curl -sI https://dumps.synkra.app/d/x` responde `404`, y `curl -sI https://dumps.synkra.app/v1/health` también (la API interna no se publica).
 
@@ -86,7 +98,7 @@ Verificación: `curl -sI https://dumps.synkra.app/d/x` responde `404`, y `curl -
 |---|---|
 | Estado y logs | `docker compose ps`, `docker compose logs -f bot gateway` |
 | Auditoría | `data/bot/audit.jsonl`, `data/gateway/audit.jsonl` |
-| Actualizar | `git pull && docker compose up -d --build` |
+| Actualizar desde tu equipo | `scripts/deploy.sh yisus@147.182.254.199` (`--dry-run` muestra los pasos; usa el HEAD, exige árbol limpio) |
 | Detener | `docker compose down` (los dumps de `data/dumps` se conservan hasta que la limpieza los borre) |
 
 El bot hace polling con el token: **dos instancias con el mismo token chocan** (409). Detén el smoke local antes de levantar el compose.

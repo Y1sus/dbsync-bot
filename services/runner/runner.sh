@@ -146,7 +146,7 @@ cmd_dump() {
     (( free >= MIN_FREE_MB )) || fail E_DISK "Espacio libre insuficiente (${free} MB < ${MIN_FREE_MB} MB)"
 
     local filename out start end
-    filename="${SERVER_ID}_${OPT_DB}_$(date +%Y%m%d_%H%M%S).sql.gz"
+    filename="${SERVER_ID}_${OPT_DB}_$(date +%Y%m%d_%H%M%S)_${job_id}.sql.gz"
     out="$DUMPS_DIR/$SERVER_ID/$filename"
     start="$(date +%s)"
     stream_dump "$engine" "$OPT_CONTAINER" "$OPT_DB" "$out"
